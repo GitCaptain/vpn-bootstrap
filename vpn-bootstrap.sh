@@ -12,6 +12,8 @@ set -Eeuo pipefail
 #   - Docker Engine from Docker's official repository
 #   - UFW firewall (SSH + Xray TCP port only)
 #   - Xray-core: VLESS + XTLS Vision + REALITY
+#   - Xray runs as the official image's non-root user on a Docker bridge network
+#     (host VPN port is published to an unprivileged container port)
 #   - Optional blocking of Russian IP destinations and .ru/.su/.рф domains
 #   - Persistent per-device VPN user management commands
 #
@@ -33,7 +35,10 @@ set -Eeuo pipefail
 #   --endpoint HOST           Client endpoint. Default: auto-detected public IPv4.
 #   --xray-port PORT          Default on first install: 443.
 #   --reality-target HOST     Default on first install: www.microsoft.com.
-#   --xray-image IMAGE        Default on first install: ghcr.io/xtls/xray-core:26.9.8.
+#   --xray-image IMAGE        Default on first install: ghcr.io/xtls/xray-core:26.3.27.
+#                             The exact stable version is pinned for reproducibility;
+#                             every run checks GitHub's latest stable release and warns
+#                             when the configured version is outdated.
 #   --block-ru                Enable RU destination blocking (default on first install).
 #   --no-block-ru             Disable RU destination blocking.
 #   --no-firewall             Do not configure/enable UFW.
@@ -72,7 +77,8 @@ PACKAGE_UPGRADE=1
 
 DEFAULT_XRAY_PORT=443
 DEFAULT_REALITY_TARGET="www.microsoft.com"
-DEFAULT_XRAY_IMAGE="ghcr.io/xtls/xray-core:26.9.8"
+DEFAULT_XRAY_IMAGE="ghcr.io/xtls/xray-core:26.3.27"
+LEGACY_BOOTSTRAP_PRERELEASE_IMAGE="ghcr.io/xtls/xray-core:26.9.8"
 XRAY_RELEASES_API="https://api.github.com/repos/XTLS/Xray-core/releases"
 
 log() {
@@ -107,7 +113,7 @@ Options:
   --reality-target HOST       REALITY target/SNI hostname.
                               Default on first install: www.microsoft.com.
   --xray-image IMAGE          Pin a specific Xray Docker image.
-                              Default on first install: ghcr.io/xtls/xray-core:26.9.8.
+                              Default on first install: ghcr.io/xtls/xray-core:26.3.27.
   --block-ru                  Block Russian IP destinations and .ru/.su/.рф domains.
                               Enabled by default on first install.
   --no-block-ru               Disable RU destination blocking.
@@ -262,6 +268,9 @@ check_xray_version() {
 
 trap '
     rc=$?
+    if (( BASH_SUBSHELL > 0 )); then
+        exit "$rc"
+    fi
     echo >&2
     echo "ERROR: bootstrap failed at line $LINENO." >&2
     echo "Command: $BASH_COMMAND" >&2
@@ -379,7 +388,7 @@ if [[ -n "$SSH_PUBKEY_FILE" ]]; then
     [[ -r "$SSH_PUBKEY_FILE" ]] || die "Cannot read public key file: $SSH_PUBKEY_FILE"
     KEY_LINE_COUNT="$(grep -cve '^[[:space:]]*$' "$SSH_PUBKEY_FILE" || true)"
     [[ "$KEY_LINE_COUNT" -eq 1 ]] || die "The public key file must contain exactly one public key."
-    SSH_PUBKEY="$(grep -ve '^[[:space:]]*$' "$SSH_PUBKEY_FILE" | head -n 1 | sed 's/\r$//')"
+    SSH_PUBKEY="$(awk 'NF { sub(/\r$/, ""); print }' "$SSH_PUBKEY_FILE")"
 fi
 
 case "$SSH_PUBKEY" in
@@ -423,8 +432,10 @@ wait_for_apt() {
 
 export DEBIAN_FRONTEND=noninteractive
 export NEEDRESTART_MODE=a
+export UCF_FORCE_CONFFOLD=1
 APT_OPTIONS=(
     -y
+    -o Dpkg::Options::=--force-confdef
     -o Dpkg::Options::=--force-confold
 )
 
@@ -454,7 +465,6 @@ apt-get "${APT_OPTIONS[@]}" install \
     unattended-upgrades \
     iproute2 \
     iptables \
-    ipset \
     ufw \
     netcat-openbsd \
     qrencode \
@@ -518,7 +528,7 @@ echo "VPN management user ready: $VPN_USER"
 # ------------------------------------------------------------------------------
 
 log "SWAP"
-if swapon --show --noheadings | grep -q .; then
+if [[ -n "$(swapon --show --noheadings)" ]]; then
     echo "Active swap already exists; leaving it unchanged."
     swapon --show
 else
@@ -528,7 +538,7 @@ else
             CREATE_SWAP=0
             ;;
         auto)
-            MEM_KIB="$(awk '/^MemTotal:/ {print $2; exit}' /proc/meminfo)"
+            MEM_KIB="$(awk '/^MemTotal:/ && !found {print $2; found=1}' /proc/meminfo)"
             [[ "$MEM_KIB" =~ ^[0-9]+$ ]] || die "Could not determine installed RAM."
             SWAP_BYTES=$(( MEM_KIB * 1024 ))
             ;;
@@ -601,7 +611,8 @@ else
     # /var/lib/docker is not deleted by this package removal.
     CONFLICTING_DOCKER_PACKAGES=()
     for package in docker.io docker-compose docker-compose-v2 docker-doc podman-docker containerd runc; do
-        if dpkg-query -W -f='${Status}' "$package" 2>/dev/null | grep -q 'ok installed'; then
+        PACKAGE_STATUS="$(dpkg-query -W -f='${Status}' "$package" 2>/dev/null || true)"
+        if [[ "$PACKAGE_STATUS" == "install ok installed" ]]; then
             CONFLICTING_DOCKER_PACKAGES+=("$package")
         fi
     done
@@ -670,7 +681,7 @@ rm -f "$DOCKER_DAEMON_TMP"
 # Harden SSH
 # ------------------------------------------------------------------------------
 
-SSH_PORT="$(sshd -T | awk '$1 == "port" {print $2; exit}')"
+SSH_PORT="$(sshd -T | awk '$1 == "port" && !found {print $2; found=1}')"
 [[ -n "$SSH_PORT" ]] || die "Could not determine SSH port."
 
 if [[ "$SSH_HARDENING" -eq 1 ]]; then
@@ -692,7 +703,7 @@ EOF
     chmod 0644 "$SSH_DROPIN"
 
     MANAGED_INCLUDE='Include /etc/ssh/sshd_config.d/00-vpn-bootstrap.conf'
-    if ! head -n 5 "$SSH_MAIN" | grep -qxF "$MANAGED_INCLUDE"; then
+    if ! sed -n '1,5p' "$SSH_MAIN" | grep -Fx "$MANAGED_INCLUDE" >/dev/null; then
         if [[ ! -e "${SSH_MAIN}.vpn-bootstrap-original" ]]; then
             cp -a "$SSH_MAIN" "${SSH_MAIN}.vpn-bootstrap-original"
         fi
@@ -735,7 +746,7 @@ fi
 # ------------------------------------------------------------------------------
 
 log "NETWORK DETECTION"
-SERVER_IPV4="$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}')"
+SERVER_IPV4="$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src" && !found){print $(i+1); found=1}}')"
 [[ -n "$SERVER_IPV4" ]] || die "Could not detect the server IPv4 address."
 
 IPV6_EGRESS_OK=0
@@ -790,7 +801,19 @@ if [[ -f "$STATE_FILE" ]]; then
     [[ -n "$REALITY_PRIVATE_KEY" && "$REALITY_PRIVATE_KEY" != "null" ]] || die "Missing REALITY private key in state."
     [[ -n "$REALITY_PUBLIC_KEY" && "$REALITY_PUBLIC_KEY" != "null" ]] || die "Missing REALITY public key in state."
 
-    if [[ -n "$XRAY_IMAGE_ARG" ]]; then XRAY_IMAGE="$XRAY_IMAGE_ARG"; fi
+    if [[ -n "$XRAY_IMAGE_ARG" ]]; then
+        XRAY_IMAGE="$XRAY_IMAGE_ARG"
+    elif [[ "$XRAY_IMAGE" == "$LEGACY_BOOTSTRAP_PRERELEASE_IMAGE" ]]; then
+        # Migrate only the prerelease image that an older bootstrap version
+        # selected by mistake. Never replace an actively running deployment
+        # behind the operator's back.
+        if [[ "$(docker inspect -f '{{.State.Running}}' "$XRAY_CONTAINER" 2>/dev/null || true)" != "true" ]]; then
+            warn "Migrating legacy bootstrap prerelease pin to stable: $DEFAULT_XRAY_IMAGE"
+            XRAY_IMAGE="$DEFAULT_XRAY_IMAGE"
+        else
+            warn "Running Xray still uses legacy prerelease $XRAY_IMAGE; preserving it. Use --xray-image explicitly to change it."
+        fi
+    fi
     if [[ -n "$XRAY_PORT_ARG" ]]; then XRAY_PORT="$XRAY_PORT_ARG"; fi
     if [[ -n "$REALITY_TARGET_ARG" ]]; then REALITY_TARGET="$REALITY_TARGET_ARG"; fi
     if [[ -n "$BLOCK_RU_ARG" ]]; then BLOCK_RU="$BLOCK_RU_ARG"; fi
@@ -876,7 +899,7 @@ if timeout 12 openssl s_client \
     -connect "${REALITY_TARGET}:443" \
     -servername "$REALITY_TARGET" \
     -tls1_3 \
-    -brief </dev/null 2>&1 | grep -q 'TLSv1.3'; then
+    -brief </dev/null 2>&1 | grep -F 'TLSv1.3' >/dev/null; then
     echo "REALITY target supports TLS 1.3: $REALITY_TARGET"
 else
     die "REALITY target failed the TLS 1.3 check: $REALITY_TARGET. Use --reality-target HOST."
@@ -899,6 +922,7 @@ STATE_FILE="$VPN_ROOT/state.json"
 USERS_FILE="$VPN_ROOT/users.json"
 COMPOSE_FILE="$VPN_ROOT/compose.yml"
 XRAY_CONTAINER="xray-reality"
+XRAY_CONTAINER_PORT=8443
 
 [[ $EUID -eq 0 ]] || { echo "ERROR: run as root" >&2; exit 1; }
 jq empty "$STATE_FILE"
@@ -911,10 +935,18 @@ REALITY_PRIVATE_KEY="$(jq -r '.reality_private_key' "$STATE_FILE")"
 BLOCK_RU="$(jq -r '.block_ru' "$STATE_FILE")"
 IPV6_OK="$(jq -r '.ipv6_egress_ok' "$STATE_FILE")"
 
-if [[ -r /proc/sys/net/ipv6/conf/all/disable_ipv6 ]] && [[ "$(cat /proc/sys/net/ipv6/conf/all/disable_ipv6)" == "0" ]]; then
+# Keep the Xray process on an unprivileged container port. Docker publishes
+# the configured host port and performs the bridge-network forwarding. Enable
+# IPv6 on the private bridge whenever the host kernel supports IPv6, even if
+# the provider's current IPv6 route is unavailable. This keeps the deployment
+# ready for IPv6 without changing the host networking model.
+if [[ -r /proc/sys/net/ipv6/conf/all/disable_ipv6 ]] && \
+   [[ "$(cat /proc/sys/net/ipv6/conf/all/disable_ipv6)" == "0" ]]; then
     LISTEN_ADDR="::"
+    NETWORK_IPV6_LINE="    enable_ipv6: true"
 else
     LISTEN_ADDR="0.0.0.0"
+    NETWORK_IPV6_LINE=""
 fi
 
 if [[ "$IPV6_OK" == "true" ]]; then
@@ -923,12 +955,17 @@ else
     FREEDOM_STRATEGY="UseIPv4"
 fi
 
-CONFIG_TMP="$(mktemp)"
-trap 'rm -f "$CONFIG_TMP"' EXIT
+# The official Xray image runs as a non-root user by default. Keep the
+# temporary config inside the root-only VPN directory. The config file itself
+# is readable because the normal runtime is non-root; the parent directory is
+# mode 0700 on the host, so unprivileged host users still cannot access it.
+CONFIG_TMP="$(mktemp "$XRAY_DIR/.config.json.tmp.XXXXXX")"
+VALIDATION_LOG="$(mktemp)"
+trap 'rm -f "$CONFIG_TMP" "$VALIDATION_LOG"' EXIT
 
 jq -n \
     --arg listen "$LISTEN_ADDR" \
-    --argjson port "$XRAY_PORT" \
+    --argjson port "$XRAY_CONTAINER_PORT" \
     --arg target "$REALITY_TARGET" \
     --arg private_key "$REALITY_PRIVATE_KEY" \
     --arg freedom_strategy "$FREEDOM_STRATEGY" \
@@ -946,11 +983,11 @@ jq -n \
           port:$port,
           protocol:"vless",
           settings:{
-            users:$clients,
+            clients:$clients,
             decryption:"none"
           },
           streamSettings:{
-            network:"raw",
+            network:"tcp",
             security:"reality",
             realitySettings:{
               show:false,
@@ -1001,26 +1038,50 @@ jq -n \
     }
     ' > "$CONFIG_TMP"
 
+# Xray's official distroless image runs without root privileges, so a 0600
+# root-owned bind mount is unreadable inside the container. The host-side
+# directory is mode 0700, therefore mode 0644 here does not expose the file to
+# unprivileged host users while allowing the non-root container to read it.
+chmod 0644 "$CONFIG_TMP"
+
 # Validate the new configuration before replacing the live one.
+# Keep Xray's diagnostic output so a configuration failure is actionable.
 docker pull "$XRAY_IMAGE" >/dev/null
-docker run --rm \
+
+if docker run --rm \
     --network none \
     -v "$CONFIG_TMP:/etc/xray/config.json:ro" \
     "$XRAY_IMAGE" \
-    run -test -config /etc/xray/config.json >/dev/null
+    run -test -config /etc/xray/config.json >"$VALIDATION_LOG" 2>&1; then
+    :
+else
+    rc=$?
+    echo "ERROR: Xray configuration validation failed (exit code $rc)." >&2
+    echo "----- Xray validation output -----" >&2
+    cat "$VALIDATION_LOG" >&2
+    echo "----------------------------------" >&2
+    exit "$rc"
+fi
 
-install -o root -g root -m 0600 "$CONFIG_TMP" "$XRAY_DIR/config.json"
+install -o root -g root -m 0644 "$CONFIG_TMP" "$XRAY_DIR/config.json"
 
+# Use the normal Docker bridge model. The official Xray image remains non-root
+# and listens on an unprivileged container port. Docker publishes the requested
+# host port (443 by default) to that internal port. No root user override and no
+# NET_BIND_SERVICE capability are required.
 cat > "$COMPOSE_FILE" <<EOF
 services:
   xray:
     image: ${XRAY_IMAGE}
     container_name: ${XRAY_CONTAINER}
-    network_mode: host
     restart: always
     read_only: true
     security_opt:
       - no-new-privileges:true
+    ports:
+      - "${XRAY_PORT}:${XRAY_CONTAINER_PORT}/tcp"
+    networks:
+      - xray-net
     volumes:
       - ./xray/config.json:/etc/xray/config.json:ro
     command: ["run", "-config", "/etc/xray/config.json"]
@@ -1029,21 +1090,28 @@ services:
       options:
         max-size: "10m"
         max-file: "3"
+
+networks:
+  xray-net:
+    driver: bridge
+${NETWORK_IPV6_LINE}
 EOF
 chmod 0600 "$COMPOSE_FILE"
 
 cd "$VPN_ROOT"
+# Validate Compose syntax before changing the running deployment.
+docker compose -f "$COMPOSE_FILE" config -q
 docker compose -f "$COMPOSE_FILE" up -d --remove-orphans
 
 for _ in $(seq 1 20); do
-    if docker inspect -f '{{.State.Running}}' "$XRAY_CONTAINER" 2>/dev/null | grep -qx true; then
-        sleep 1
+    if [[ "$(docker inspect -f '{{.State.Running}}' "$XRAY_CONTAINER" 2>/dev/null || true)" == "true" ]] && \
+       nc -4 -z -w 1 127.0.0.1 "$XRAY_PORT" >/dev/null 2>&1; then
         exit 0
     fi
     sleep 1
 done
 
-echo "ERROR: Xray did not become healthy." >&2
+echo "ERROR: Xray did not become ready through published host TCP/$XRAY_PORT." >&2
 docker logs --tail 100 "$XRAY_CONTAINER" >&2 || true
 exit 1
 RENDER
@@ -1099,7 +1167,7 @@ show_user() {
     local name="$1"
     load_state
     local row uuid sid
-    row="$(jq -c --arg n "$name" '.users[]? | select(.name==$n)' "$USERS_FILE" | head -n 1)"
+    row="$(jq -c --arg n "$name" 'first(.users[]? | select(.name==$n)) // empty' "$USERS_FILE")"
     [[ -n "$row" ]] || { echo "ERROR: user not found: $name" >&2; exit 1; }
     uuid="$(jq -r '.uuid' <<< "$row")"
     sid="$(jq -r '.sid' <<< "$row")"
@@ -1197,8 +1265,8 @@ status() {
     echo "Xray container:"
     docker ps --filter "name=^/${XRAY_CONTAINER}$" --format '  {{.Names}}  {{.Status}}  {{.Image}}'
     echo
-    echo "Listener:"
-    ss -ltnp | grep -E ":${XRAY_PORT}[[:space:]]" || true
+    echo "Published port:"
+    docker port "$XRAY_CONTAINER" 2>/dev/null || true
     echo
     echo "Configuration:"
     echo "  Endpoint:       $ENDPOINT_HOST:$XRAY_PORT"
@@ -1271,8 +1339,8 @@ chmod 0700 /usr/local/sbin/vpn-add-user /usr/local/sbin/vpn-remove-user \
 # ------------------------------------------------------------------------------
 
 log "XRAY PORT CHECK"
-if ss -ltnH | awk '{print $4}' | grep -Eq "(^|:|\\])${XRAY_PORT}$"; then
-    if docker ps --format '{{.Names}}' | grep -qx "$XRAY_CONTAINER"; then
+if ss -H -ltn "sport = :${XRAY_PORT}" | awk 'NF {found=1} END {exit !found}'; then
+    if docker ps --format '{{.Names}}' | grep -Fx "$XRAY_CONTAINER" >/dev/null; then
         echo "TCP/$XRAY_PORT is already owned by the existing Xray deployment."
     else
         echo "TCP/$XRAY_PORT is already occupied:"
@@ -1290,24 +1358,26 @@ fi
 log "XRAY DEPLOYMENT"
 /usr/local/libexec/vpn-render-xray
 
-docker inspect -f '{{.State.Running}}' "$XRAY_CONTAINER" | grep -qx true || die "Xray container is not running."
+[[ "$(docker inspect -f '{{.State.Running}}' "$XRAY_CONTAINER" 2>/dev/null || true)" == "true" ]] || \
+    die "Xray container is not running."
 
-# Verify IPv4 reachability of the local listener. On Ubuntu, an [::] wildcard
-# listener is normally dual-stack and accepts both IPv4 and IPv6.
+# Verify the Docker-published host port over IPv4.
 if ! nc -4 -z -w 2 127.0.0.1 "$XRAY_PORT"; then
     docker logs --tail 100 "$XRAY_CONTAINER" || true
-    die "Xray is running but is not accepting IPv4 connections on TCP/$XRAY_PORT."
+    die "Xray container is running but Docker is not forwarding IPv4 TCP/$XRAY_PORT to Xray."
 fi
 
-echo "Xray is accepting IPv4 TCP connections on port $XRAY_PORT."
+echo "Xray is reachable through Docker on IPv4 TCP/$XRAY_PORT."
 if nc -6 -z -w 2 ::1 "$XRAY_PORT" >/dev/null 2>&1; then
-    echo "Xray local IPv6 listener: OK"
+    echo "Xray Docker-published IPv6 host port: OK"
 else
-    echo "Xray local IPv6 listener: unavailable"
+    echo "Xray Docker-published IPv6 host port: unavailable"
 fi
 
 # ------------------------------------------------------------------------------
-# Configure UFW after SSH and Xray ports are known
+# Configure UFW after SSH and Xray ports are known. Docker manages the
+# published Xray port with its own firewall/NAT rules; the explicit UFW allow
+# documents the intended host policy and protects ordinary host services.
 # ------------------------------------------------------------------------------
 
 if [[ "$CONFIGURE_FIREWALL" -eq 1 ]]; then
