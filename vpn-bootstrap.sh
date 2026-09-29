@@ -2,124 +2,263 @@
 set -Eeuo pipefail
 
 # ==============================================================================
-# VPN Server Bootstrap
+# Incremental VPN server bootstrap for Ubuntu 22.04 / 24.04 LTS
 #
-# Supported OS:
-#   Ubuntu 22.04 LTS
-#   Ubuntu 24.04 LTS
-#   Ubuntu 26.04 LTS
+# Installs and maintains:
+#   - VPN management user with SSH public-key access and passwordless sudo
+#   - SSH hardening (no root login, no password login)
+#   - Optional swap (default: approximately equal to installed RAM)
+#   - Unattended Ubuntu security updates (without automatic reboot)
+#   - Docker Engine from Docker's official repository
+#   - UFW firewall (SSH + Xray TCP port only)
+#   - Xray-core: VLESS + XTLS Vision + REALITY
+#   - Optional blocking of Russian IP destinations and .ru/.su/.рф domains
+#   - Persistent per-device VPN user management commands
 #
-# This script:
-#   - Updates installed packages
-#   - Installs minimal server administration dependencies
-#   - Creates a dedicated VPN management user
-#   - Installs an SSH public key
-#   - Grants passwordless sudo to the VPN management user
-#   - Disables SSH root login and SSH password authentication
-#   - Optionally creates swap (default: same size as RAM)
-#   - Enables unattended Ubuntu security updates
-#   - Installs Docker Engine from Docker's official repository
-#   - Enables Docker at boot
-#   - Performs basic IPv4/IPv6 and service diagnostics
+# The script is incremental/idempotent:
+#   - Existing users, keys, VPN users and REALITY keys are preserved.
+#   - Existing active swap is preserved.
+#   - Existing Docker installation is reused if functional.
+#   - Xray configuration is regenerated from persistent state without rotating keys.
+#   - Re-running the same command is safe.
 #
-# This script does NOT:
-#   - Upgrade Ubuntu to another release
-#   - Reboot the server
-#   - Change the SSH port
-#   - Configure a firewall
-#   - Install Xray or AmneziaWG
+# The script never reboots the server and never upgrades Ubuntu to another release.
 #
-# Usage:
-#
-#   ./vpn-bootstrap.sh \
-#       --user vpn \
-#       --pubkey-file /root/id_ed25519.pub
-#
-#   ./vpn-bootstrap.sh \
-#       --user vpn \
-#       --pubkey 'ssh-ed25519 AAAA... workstation'
-#
-# Options:
-#
+# Required options:
 #   --user USER
-#       Required.
-#       User account that will manage the VPN server.
+#   --pubkey KEY              OR --pubkey-file FILE
 #
-#   --pubkey KEY
-#       SSH public key as a quoted command-line argument.
-#
-#   --pubkey-file FILE
-#       Read the SSH public key from FILE.
-#
-#   --swap auto
-#       Create swap approximately equal to installed RAM.
-#       This is the default.
-#
-#   --swap none
-#       Do not create swap.
-#
-#   --swap SIZE
-#       Explicit swap size, for example:
-#           512M
-#           1G
-#           2G
-#
-#   --skip-package-upgrade
-#       Install required packages but do not upgrade all currently
-#       installed Ubuntu packages.
-#
+# Common options:
+#   --swap auto|none|SIZE     Default: auto. Examples: 512M, 1G, 2G.
+#   --endpoint HOST           Client endpoint. Default: auto-detected public IPv4.
+#   --xray-port PORT          Default on first install: 443.
+#   --reality-target HOST     Default on first install: www.microsoft.com.
+#   --xray-image IMAGE        Default on first install: ghcr.io/xtls/xray-core:26.9.8.
+#   --block-ru                Enable RU destination blocking (default on first install).
+#   --no-block-ru             Disable RU destination blocking.
+#   --no-firewall             Do not configure/enable UFW.
+#   --no-ssh-hardening        Do not change SSH authentication policy.
+#   --skip-package-upgrade    Skip apt-get upgrade.
 #   --help
-#       Show this help.
 #
-# Notes:
-#
-#   - If any swap is already active, this script leaves it unchanged.
-#   - The VPN management user is NOT added to the docker group.
-#     Docker operations should be performed through sudo.
-#   - SSH password authentication is disabled.
-#   - The VPN management user has passwordless sudo because the account
-#     is accessible exclusively through its SSH key.
+# Example:
+#   sudo ./vpn-bootstrap.sh \
+#     --user vpn \
+#     --pubkey-file /root/id_ed25519.pub \
+#     --swap auto
 # ==============================================================================
 
-
-# ------------------------------------------------------------------------------
-# General helpers
-# ------------------------------------------------------------------------------
-
 SCRIPT_NAME="$(basename "$0")"
+VPN_ROOT="/opt/vpn-stack"
+XRAY_DIR="$VPN_ROOT/xray"
+USERS_FILE="$VPN_ROOT/users.json"
+STATE_FILE="$VPN_ROOT/state.json"
+COMPOSE_FILE="$VPN_ROOT/compose.yml"
+LOCK_FILE="$VPN_ROOT/.lock"
+XRAY_CONTAINER="xray-reality"
 
 VPN_USER=""
 SSH_PUBKEY=""
 SSH_PUBKEY_FILE=""
 SWAP_SIZE="auto"
+ENDPOINT_ARG=""
+XRAY_PORT_ARG=""
+REALITY_TARGET_ARG=""
+XRAY_IMAGE_ARG=""
+BLOCK_RU_ARG=""
+CONFIGURE_FIREWALL=1
+SSH_HARDENING=1
 PACKAGE_UPGRADE=1
 
+DEFAULT_XRAY_PORT=443
+DEFAULT_REALITY_TARGET="www.microsoft.com"
+DEFAULT_XRAY_IMAGE="ghcr.io/xtls/xray-core:26.9.8"
+XRAY_RELEASES_API="https://api.github.com/repos/XTLS/Xray-core/releases"
 
 log() {
     printf '\n===== %s =====\n' "$*"
 }
-
 
 die() {
     echo "ERROR: $*" >&2
     exit 1
 }
 
-
-usage() {
-    sed -n '2,/^# ==============================================================================/{s/^# \{0,1\}//;p}' "$0"
+warn() {
+    echo "WARNING: $*" >&2
 }
 
+usage() {
+    cat <<'EOF'
+Usage:
+  sudo ./vpn-bootstrap.sh --user USER (--pubkey KEY | --pubkey-file FILE) [OPTIONS]
+
+Required:
+  --user USER                 VPN management user to create or maintain.
+  --pubkey KEY                OpenSSH public key as one quoted argument.
+  --pubkey-file FILE          Read exactly one OpenSSH public key from FILE.
+                              Use either --pubkey or --pubkey-file.
+
+Options:
+  --swap auto|none|SIZE       Swap policy. Default: auto (approximately RAM size).
+                              Examples: none, 512M, 1G, 2G.
+  --endpoint HOST             Client endpoint. Default: detected public IPv4.
+  --xray-port PORT            Xray TCP port. Default on first install: 443.
+  --reality-target HOST       REALITY target/SNI hostname.
+                              Default on first install: www.microsoft.com.
+  --xray-image IMAGE          Pin a specific Xray Docker image.
+                              Default on first install: ghcr.io/xtls/xray-core:26.9.8.
+  --block-ru                  Block Russian IP destinations and .ru/.su/.рф domains.
+                              Enabled by default on first install.
+  --no-block-ru               Disable RU destination blocking.
+  --no-firewall               Do not configure or enable UFW.
+  --no-ssh-hardening          Do not change SSH authentication policy.
+  --skip-package-upgrade      Skip apt-get upgrade.
+  --help, -h                  Show this help and exit.
+
+Behavior:
+  - Non-interactive: the script never asks questions while running.
+  - Incremental: existing VPN users and REALITY keys are preserved.
+  - Existing active swap is preserved.
+  - Functional Docker is reused.
+  - The pinned Xray version is checked against GitHub's latest stable release.
+    A failed online version check does not abort installation.
+  - The server is never rebooted automatically.
+
+Example:
+  sudo ./vpn-bootstrap.sh \
+    --user vpn \
+    --pubkey-file /root/id_ed25519.pub \
+    --swap auto
+EOF
+}
 
 require_value() {
     local option="$1"
     local value="${2:-}"
-
     if [[ -z "$value" || "$value" == --* ]]; then
         die "$option requires a value."
     fi
 }
 
+json_bool() {
+    [[ "$1" == "1" ]] && printf 'true' || printf 'false'
+}
+
+is_valid_port() {
+    [[ "$1" =~ ^[0-9]+$ ]] && (( "$1" >= 1 && "$1" <= 65535 ))
+}
+
+is_valid_username() {
+    [[ "$1" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]]
+}
+
+is_valid_hostname_or_ip() {
+    local value="$1"
+    [[ -n "$value" ]] || return 1
+    [[ "$value" != *"://"* ]] || return 1
+    [[ "$value" != *"/"* ]] || return 1
+    [[ "$value" != *" "* ]] || return 1
+    return 0
+}
+
+url_host() {
+    local host="$1"
+    if [[ "$host" == *:* && "$host" != \[*\] ]]; then
+        printf '[%s]' "$host"
+    else
+        printf '%s' "$host"
+    fi
+}
+
+xray_image_tag() {
+    local image="$1"
+
+    # Only compare the official Xray image when it uses a simple version tag.
+    [[ "$image" == ghcr.io/xtls/xray-core:* ]] || return 1
+    [[ "$image" != *@* ]] || return 1
+
+    local tag="${image##*:}"
+    [[ "$tag" =~ ^v?[0-9]+([.][0-9]+)+$ ]] || return 1
+    printf '%s\n' "${tag#v}"
+}
+
+version_is_older() {
+    local current="$1"
+    local latest="$2"
+    [[ "$current" != "$latest" ]] || return 1
+    [[ "$(printf '%s\n%s\n' "$current" "$latest" | sort -V | tail -n 1)" == "$latest" ]]
+}
+
+check_xray_version() {
+    local image="$1"
+    local current latest_json latest_tag latest current_release prerelease release_url
+
+    current="$(xray_image_tag "$image" 2>/dev/null || true)"
+
+    if [[ -z "$current" ]]; then
+        warn "Xray stable-version comparison skipped for custom/unversioned image: $image"
+        return 0
+    fi
+
+    latest_json="$(
+        curl -fsSL \
+            --connect-timeout 4 \
+            --max-time 8 \
+            -H 'Accept: application/vnd.github+json' \
+            -H 'User-Agent: vpn-bootstrap-xray-version-check' \
+            "${XRAY_RELEASES_API}/latest" \
+            2>/dev/null || true
+    )"
+
+    latest_tag="$(jq -r '.tag_name // empty' <<< "$latest_json" 2>/dev/null || true)"
+    latest="${latest_tag#v}"
+
+    if [[ -z "$latest" || ! "$latest" =~ ^[0-9]+([.][0-9]+)+$ ]]; then
+        warn "Could not determine the latest stable Xray release from GitHub; continuing with $image."
+        return 0
+    fi
+
+    # Check whether the currently pinned release itself is marked as a prerelease.
+    # Try the usual v-prefixed release tag first, then the plain version tag.
+    current_release="$(
+        curl -fsSL \
+            --connect-timeout 4 \
+            --max-time 8 \
+            -H 'Accept: application/vnd.github+json' \
+            -H 'User-Agent: vpn-bootstrap-xray-version-check' \
+            "${XRAY_RELEASES_API}/tags/v${current}" \
+            2>/dev/null || \
+        curl -fsSL \
+            --connect-timeout 4 \
+            --max-time 8 \
+            -H 'Accept: application/vnd.github+json' \
+            -H 'User-Agent: vpn-bootstrap-xray-version-check' \
+            "${XRAY_RELEASES_API}/tags/${current}" \
+            2>/dev/null || true
+    )"
+
+    prerelease="$(jq -r '.prerelease // empty' <<< "$current_release" 2>/dev/null || true)"
+    release_url="$(jq -r '.html_url // empty' <<< "$latest_json" 2>/dev/null || true)"
+
+    echo "Pinned Xray version : $current"
+    echo "Latest stable Xray : $latest"
+
+    if [[ "$prerelease" == "true" ]]; then
+        warn "Pinned Xray $current is marked as a PRE-RELEASE by GitHub."
+    fi
+
+    if version_is_older "$current" "$latest"; then
+        warn "Pinned Xray $current is OUTDATED; latest stable is $latest."
+        warn "To upgrade intentionally, rerun with: --xray-image ghcr.io/xtls/xray-core:${latest}"
+        [[ -n "$release_url" ]] && warn "Release: $release_url"
+    elif [[ "$current" == "$latest" ]]; then
+        echo "Xray stable-version check: up to date."
+    else
+        # A newer numeric version than the latest stable is usually a prerelease.
+        warn "Pinned Xray $current is newer than the latest stable $latest; verify that this is intentional."
+    fi
+}
 
 trap '
     rc=$?
@@ -130,201 +269,179 @@ trap '
     exit "$rc"
 ' ERR
 
-
 # ------------------------------------------------------------------------------
-# Parse CLI arguments
+# Parse command-line options
 # ------------------------------------------------------------------------------
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-
         --user)
             require_value "$1" "${2:-}"
             VPN_USER="$2"
             shift 2
             ;;
-
         --pubkey)
             require_value "$1" "${2:-}"
             SSH_PUBKEY="$2"
             shift 2
             ;;
-
         --pubkey-file)
             require_value "$1" "${2:-}"
             SSH_PUBKEY_FILE="$2"
             shift 2
             ;;
-
         --swap)
             require_value "$1" "${2:-}"
             SWAP_SIZE="$2"
             shift 2
             ;;
-
+        --endpoint)
+            require_value "$1" "${2:-}"
+            ENDPOINT_ARG="$2"
+            shift 2
+            ;;
+        --xray-port)
+            require_value "$1" "${2:-}"
+            XRAY_PORT_ARG="$2"
+            shift 2
+            ;;
+        --reality-target)
+            require_value "$1" "${2:-}"
+            REALITY_TARGET_ARG="$2"
+            shift 2
+            ;;
+        --xray-image)
+            require_value "$1" "${2:-}"
+            XRAY_IMAGE_ARG="$2"
+            shift 2
+            ;;
+        --block-ru)
+            BLOCK_RU_ARG="true"
+            shift
+            ;;
+        --no-block-ru)
+            BLOCK_RU_ARG="false"
+            shift
+            ;;
+        --no-firewall)
+            CONFIGURE_FIREWALL=0
+            shift
+            ;;
+        --no-ssh-hardening)
+            SSH_HARDENING=0
+            shift
+            ;;
         --skip-package-upgrade)
             PACKAGE_UPGRADE=0
             shift
             ;;
-
         --help|-h)
             usage
             exit 0
             ;;
-
         *)
             die "Unknown option: $1. Run $SCRIPT_NAME --help."
             ;;
     esac
 done
 
-
 # ------------------------------------------------------------------------------
-# Validate execution context
+# Validate arguments and execution context
 # ------------------------------------------------------------------------------
 
-if [[ "$EUID" -ne 0 ]]; then
-    die "Run this script as root or through sudo."
-fi
-
-
-if [[ -z "$VPN_USER" ]]; then
-    die "--user is required."
-fi
-
-
-if [[ ! "$VPN_USER" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]]; then
-    die "Invalid VPN management username: $VPN_USER"
-fi
-
-
-if [[ "$VPN_USER" == "root" ]]; then
-    die "The VPN management user cannot be root."
-fi
-
+[[ "$EUID" -eq 0 ]] || die "Run this script as root or through sudo."
+[[ -n "$VPN_USER" ]] || die "--user is required."
+is_valid_username "$VPN_USER" || die "Invalid VPN management username: $VPN_USER"
+[[ "$VPN_USER" != "root" ]] || die "The VPN management username cannot be root."
 
 if [[ -n "$SSH_PUBKEY" && -n "$SSH_PUBKEY_FILE" ]]; then
     die "Use either --pubkey or --pubkey-file, not both."
 fi
 
-
 if [[ -z "$SSH_PUBKEY" && -z "$SSH_PUBKEY_FILE" ]]; then
     die "One of --pubkey or --pubkey-file is required."
 fi
 
-
-if [[ -n "$SSH_PUBKEY_FILE" ]]; then
-
-    if [[ ! -r "$SSH_PUBKEY_FILE" ]]; then
-        die "Cannot read public key file: $SSH_PUBKEY_FILE"
-    fi
-
-    KEY_LINE_COUNT="$(
-        grep -cve '^[[:space:]]*$' "$SSH_PUBKEY_FILE" || true
-    )"
-
-    if [[ "$KEY_LINE_COUNT" -ne 1 ]]; then
-        die "The public key file must contain exactly one public key."
-    fi
-
-    SSH_PUBKEY="$(
-        grep -ve '^[[:space:]]*$' "$SSH_PUBKEY_FILE" |
-        head -n 1 |
-        sed 's/\r$//'
-    )"
+if [[ -n "$XRAY_PORT_ARG" ]]; then
+    is_valid_port "$XRAY_PORT_ARG" || die "Invalid --xray-port: $XRAY_PORT_ARG"
 fi
 
+if [[ -n "$ENDPOINT_ARG" ]]; then
+    is_valid_hostname_or_ip "$ENDPOINT_ARG" || die "Invalid --endpoint: $ENDPOINT_ARG"
+fi
+
+if [[ -n "$REALITY_TARGET_ARG" ]]; then
+    is_valid_hostname_or_ip "$REALITY_TARGET_ARG" || die "Invalid --reality-target: $REALITY_TARGET_ARG"
+    [[ "$REALITY_TARGET_ARG" != *:* ]] || die "--reality-target must be a hostname without a port."
+fi
+
+if [[ -n "$SSH_PUBKEY_FILE" ]]; then
+    [[ -r "$SSH_PUBKEY_FILE" ]] || die "Cannot read public key file: $SSH_PUBKEY_FILE"
+    KEY_LINE_COUNT="$(grep -cve '^[[:space:]]*$' "$SSH_PUBKEY_FILE" || true)"
+    [[ "$KEY_LINE_COUNT" -eq 1 ]] || die "The public key file must contain exactly one public key."
+    SSH_PUBKEY="$(grep -ve '^[[:space:]]*$' "$SSH_PUBKEY_FILE" | head -n 1 | sed 's/\r$//')"
+fi
 
 case "$SSH_PUBKEY" in
-    ssh-*|ecdsa-*|sk-*)
-        ;;
-    *)
-        die "The supplied value does not look like an OpenSSH public key."
-        ;;
+    ssh-*|ecdsa-*|sk-*) ;;
+    *) die "The supplied value does not look like an OpenSSH public key." ;;
 esac
-
 
 # ------------------------------------------------------------------------------
 # Validate operating system
 # ------------------------------------------------------------------------------
 
 log "OPERATING SYSTEM"
-
-if [[ ! -r /etc/os-release ]]; then
-    die "/etc/os-release is missing."
-fi
-
+[[ -r /etc/os-release ]] || die "/etc/os-release is missing."
 # shellcheck disable=SC1091
 source /etc/os-release
-
-
-if [[ "${ID:-}" != "ubuntu" ]]; then
-    die "This bootstrap currently supports Ubuntu only."
-fi
-
-
+[[ "${ID:-}" == "ubuntu" ]] || die "This bootstrap currently supports Ubuntu only."
 case "${VERSION_ID:-}" in
-    22.04|24.04|26.04)
-        ;;
-    *)
-        die \
-            "Unsupported Ubuntu version: ${VERSION_ID:-unknown}. \
-Use Ubuntu 22.04, 24.04 or 26.04."
-        ;;
+    22.04|24.04) ;;
+    *) die "Unsupported Ubuntu version: ${VERSION_ID:-unknown}. Use Ubuntu 22.04 or 24.04 LTS." ;;
 esac
-
 
 echo "Distribution : ${PRETTY_NAME:-Ubuntu}"
 echo "Kernel       : $(uname -r)"
 echo "Architecture : $(uname -m)"
 
+# ------------------------------------------------------------------------------
+# Wait for cloud-init/apt package locks
+# ------------------------------------------------------------------------------
 
-# ------------------------------------------------------------------------------
-# Configure non-interactive package management
-# ------------------------------------------------------------------------------
+wait_for_apt() {
+    local waited=0
+    local max_wait=300
+    while fuser /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/cache/apt/archives/lock >/dev/null 2>&1; do
+        if (( waited >= max_wait )); then
+            die "APT/dpkg remained locked for more than ${max_wait}s."
+        fi
+        sleep 2
+        waited=$(( waited + 2 ))
+    done
+}
 
 export DEBIAN_FRONTEND=noninteractive
 export NEEDRESTART_MODE=a
-export UCF_FORCE_CONFFOLD=1
-
 APT_OPTIONS=(
     -y
     -o Dpkg::Options::=--force-confold
 )
 
-
-# ------------------------------------------------------------------------------
-# Update package indexes
-# ------------------------------------------------------------------------------
-
-log "APT UPDATE"
-
+log "PACKAGE INDEX"
+wait_for_apt
 apt-get update
 
-
-# ------------------------------------------------------------------------------
-# Upgrade existing packages
-# ------------------------------------------------------------------------------
-
 if [[ "$PACKAGE_UPGRADE" -eq 1 ]]; then
-
     log "PACKAGE UPGRADE"
-
+    wait_for_apt
     apt-get "${APT_OPTIONS[@]}" upgrade
-
 else
-
     log "PACKAGE UPGRADE SKIPPED"
-
 fi
 
-
-# ------------------------------------------------------------------------------
-# Install base dependencies
-# ------------------------------------------------------------------------------
-
 log "BASE PACKAGES"
-
+wait_for_apt
 apt-get "${APT_OPTIONS[@]}" install \
     ca-certificates \
     curl \
@@ -332,420 +449,178 @@ apt-get "${APT_OPTIONS[@]}" install \
     jq \
     openssh-client \
     openssh-server \
+    openssl \
     sudo \
     unattended-upgrades \
     iproute2 \
     iptables \
     ipset \
+    ufw \
+    netcat-openbsd \
+    qrencode \
+    util-linux \
     e2fsprogs
-
 
 # ------------------------------------------------------------------------------
 # Validate SSH public key using OpenSSH
 # ------------------------------------------------------------------------------
 
 log "SSH PUBLIC KEY VALIDATION"
-
 KEY_TMP="$(mktemp)"
-
 printf '%s\n' "$SSH_PUBKEY" > "$KEY_TMP"
-
 if ! ssh-keygen -l -f "$KEY_TMP"; then
     rm -f "$KEY_TMP"
     die "OpenSSH rejected the supplied public key."
 fi
-
 rm -f "$KEY_TMP"
 
-
 # ------------------------------------------------------------------------------
-# Create VPN management user
+# Create/update VPN management user
 # ------------------------------------------------------------------------------
 
 log "VPN MANAGEMENT USER"
-
 if id "$VPN_USER" >/dev/null 2>&1; then
-
     echo "User already exists: $VPN_USER"
-
 else
-
-    useradd \
-        --create-home \
-        --shell /bin/bash \
-        "$VPN_USER"
-
+    useradd --create-home --shell /bin/bash "$VPN_USER"
     echo "Created user: $VPN_USER"
-
 fi
 
-
-# Ensure the account has a normal shell.
-
-usermod \
-    --shell /bin/bash \
-    "$VPN_USER"
-
-
-# Disable Unix password login for the account.
-# SSH public-key authentication will be used instead.
-
+usermod --shell /bin/bash "$VPN_USER"
+usermod -aG sudo "$VPN_USER"
 passwd -l "$VPN_USER" >/dev/null 2>&1 || true
-
-
-# Add the management user to Ubuntu's sudo group.
-
-usermod \
-    -aG sudo \
-    "$VPN_USER"
-
-
-# ------------------------------------------------------------------------------
-# Configure passwordless sudo
-# ------------------------------------------------------------------------------
-
-log "SUDO CONFIGURATION"
 
 SUDOERS_FILE="/etc/sudoers.d/90-vpn-management-${VPN_USER}"
 SUDOERS_TMP="$(mktemp)"
-
-printf '%s ALL=(ALL:ALL) NOPASSWD: ALL\n' \
-    "$VPN_USER" \
-    > "$SUDOERS_TMP"
-
-chmod 440 "$SUDOERS_TMP"
-
-if ! visudo -cf "$SUDOERS_TMP"; then
-    rm -f "$SUDOERS_TMP"
-    die "Generated sudoers configuration is invalid."
-fi
-
-install \
-    -o root \
-    -g root \
-    -m 0440 \
-    "$SUDOERS_TMP" \
-    "$SUDOERS_FILE"
-
+printf '%s ALL=(ALL:ALL) NOPASSWD: ALL\n' "$VPN_USER" > "$SUDOERS_TMP"
+chmod 0440 "$SUDOERS_TMP"
+visudo -cf "$SUDOERS_TMP" >/dev/null
+install -o root -g root -m 0440 "$SUDOERS_TMP" "$SUDOERS_FILE"
 rm -f "$SUDOERS_TMP"
 
-echo "Passwordless sudo configured for: $VPN_USER"
-
-
-# ------------------------------------------------------------------------------
-# Install SSH authorized key
-# ------------------------------------------------------------------------------
-
-log "SSH AUTHORIZED KEY"
-
-USER_HOME="$(
-    getent passwd "$VPN_USER" |
-    cut -d: -f6
-)"
-
-if [[ -z "$USER_HOME" ]]; then
-    die "Could not determine home directory for $VPN_USER."
-fi
-
-
-install \
-    -d \
-    -o "$VPN_USER" \
-    -g "$VPN_USER" \
-    -m 0700 \
-    "$USER_HOME/.ssh"
-
-
+USER_HOME="$(getent passwd "$VPN_USER" | cut -d: -f6)"
+[[ -n "$USER_HOME" ]] || die "Could not determine home directory for $VPN_USER."
+install -d -o "$VPN_USER" -g "$VPN_USER" -m 0700 "$USER_HOME/.ssh"
 AUTHORIZED_KEYS="$USER_HOME/.ssh/authorized_keys"
-
 touch "$AUTHORIZED_KEYS"
-
-chown \
-    "$VPN_USER:$VPN_USER" \
-    "$AUTHORIZED_KEYS"
-
+chown "$VPN_USER:$VPN_USER" "$AUTHORIZED_KEYS"
 chmod 0600 "$AUTHORIZED_KEYS"
-
-
 if ! grep -qxF "$SSH_PUBKEY" "$AUTHORIZED_KEYS"; then
     printf '%s\n' "$SSH_PUBKEY" >> "$AUTHORIZED_KEYS"
 fi
-
-
-chown \
-    "$VPN_USER:$VPN_USER" \
-    "$AUTHORIZED_KEYS"
-
+chown "$VPN_USER:$VPN_USER" "$AUTHORIZED_KEYS"
 chmod 0600 "$AUTHORIZED_KEYS"
 
-echo "SSH public key installed for: $VPN_USER"
-
+echo "VPN management user ready: $VPN_USER"
 
 # ------------------------------------------------------------------------------
 # Configure swap
 # ------------------------------------------------------------------------------
 
 log "SWAP"
-
 if swapon --show --noheadings | grep -q .; then
-
-    echo "Active swap already exists."
-    echo "Existing swap will not be modified."
+    echo "Active swap already exists; leaving it unchanged."
     swapon --show
-
 else
-
+    CREATE_SWAP=1
     case "${SWAP_SIZE,,}" in
-
         none|off|0)
-            echo "Swap creation disabled."
+            CREATE_SWAP=0
             ;;
-
         auto)
-
-            MEM_KIB="$(
-                awk '/^MemTotal:/ {print $2; exit}' /proc/meminfo
-            )"
-
-            if [[ ! "$MEM_KIB" =~ ^[0-9]+$ ]]; then
-                die "Could not determine installed RAM."
-            fi
-
+            MEM_KIB="$(awk '/^MemTotal:/ {print $2; exit}' /proc/meminfo)"
+            [[ "$MEM_KIB" =~ ^[0-9]+$ ]] || die "Could not determine installed RAM."
             SWAP_BYTES=$(( MEM_KIB * 1024 ))
             ;;
-
         *)
-
-            if ! SWAP_BYTES="$(
-                numfmt \
-                    --from=iec \
-                    "$SWAP_SIZE" \
-                    2>/dev/null
-            )"; then
-                die \
-                    "Invalid --swap value '$SWAP_SIZE'. \
-Use auto, none, 512M, 1G, 2G, etc."
-            fi
-
-            if (( SWAP_BYTES < 64 * 1024 * 1024 )); then
-                die "Swap must be at least 64 MiB, or use --swap none."
-            fi
+            SWAP_BYTES="$(numfmt --from=iec "$SWAP_SIZE" 2>/dev/null)" || \
+                die "Invalid --swap value '$SWAP_SIZE'. Use auto, none, 512M, 1G, 2G, etc."
+            (( SWAP_BYTES >= 64 * 1024 * 1024 )) || die "Swap must be at least 64 MiB, or use --swap none."
             ;;
     esac
 
-
-    if [[ "${SWAP_SIZE,,}" != "none" &&
-          "${SWAP_SIZE,,}" != "off" &&
-          "$SWAP_SIZE" != "0" ]]; then
-
-        SWAP_MIB=$(
-            (
-                SWAP_BYTES + 1024 * 1024 - 1
-            ) / (1024 * 1024)
-        )
-
-        SWAP_DISPLAY="$(
-            numfmt \
-                --to=iec-i \
-                --suffix=B \
-                "$(( SWAP_MIB * 1024 * 1024 ))"
-        )"
-
-        DISK_AVAILABLE="$(
-            df \
-                -B1 \
-                --output=avail \
-                / |
-            tail -n 1 |
-            tr -d ' '
-        )"
-
-        DISK_RESERVE=$(( 256 * 1024 * 1024 ))
-
-        if (( SWAP_MIB * 1024 * 1024 + DISK_RESERVE > DISK_AVAILABLE )); then
-            die \
-                "Not enough free disk space for $SWAP_DISPLAY swap \
-while keeping 256 MiB reserved."
-        fi
-
+    if [[ "$CREATE_SWAP" -eq 0 ]]; then
+        echo "Swap creation disabled."
+    else
+        SWAP_MIB=$(( (SWAP_BYTES + 1024 * 1024 - 1) / (1024 * 1024) ))
+        SWAP_DISPLAY="$(numfmt --to=iec-i --suffix=B "$(( SWAP_MIB * 1024 * 1024 ))")"
+        DISK_AVAILABLE="$(df -B1 --output=avail / | tail -n 1 | tr -d ' ')"
+        DISK_RESERVE=$(( 512 * 1024 * 1024 ))
+        (( SWAP_MIB * 1024 * 1024 + DISK_RESERVE <= DISK_AVAILABLE )) || \
+            die "Not enough free disk space for $SWAP_DISPLAY swap while keeping 512 MiB reserved."
 
         echo "Creating swap: $SWAP_DISPLAY"
-
-
         if [[ -e /swapfile ]]; then
             swapoff /swapfile >/dev/null 2>&1 || true
             rm -f /swapfile
         fi
 
-
-        ROOT_FS="$(
-            findmnt \
-                -n \
-                -o FSTYPE \
-                /
-        )"
-
-
+        ROOT_FS="$(findmnt -n -o FSTYPE /)"
         if [[ "$ROOT_FS" == "btrfs" ]]; then
-
             touch /swapfile
-
-            if ! chattr +C /swapfile; then
-                rm -f /swapfile
-                die "Could not disable copy-on-write for Btrfs swapfile."
-            fi
-
+            chattr +C /swapfile || { rm -f /swapfile; die "Could not disable CoW for Btrfs swapfile."; }
         fi
 
-
-        dd \
-            if=/dev/zero \
-            of=/swapfile \
-            bs=1M \
-            count="$SWAP_MIB" \
-            status=progress
-
-
+        dd if=/dev/zero of=/swapfile bs=1M count="$SWAP_MIB" status=progress
         chmod 0600 /swapfile
-
         mkswap /swapfile >/dev/null
-
         swapon /swapfile
-
-
-        if ! grep -qE \
-            '^[[:space:]]*/swapfile[[:space:]]' \
-            /etc/fstab; then
-
-            echo '/swapfile none swap sw 0 0' \
-                >> /etc/fstab
-        fi
-
-
-        echo
+        grep -qE '^[[:space:]]*/swapfile[[:space:]]' /etc/fstab || \
+            echo '/swapfile none swap sw 0 0' >> /etc/fstab
         swapon --show
-
     fi
 fi
 
-
 # ------------------------------------------------------------------------------
-# Configure unattended Ubuntu security updates
+# Enable unattended security updates without automatic reboot
 # ------------------------------------------------------------------------------
 
 log "AUTOMATIC SECURITY UPDATES"
-
 cat > /etc/apt/apt.conf.d/20auto-upgrades <<'EOF'
 APT::Periodic::Update-Package-Lists "1";
 APT::Periodic::Unattended-Upgrade "1";
 EOF
 
-
 cat > /etc/apt/apt.conf.d/52-vpn-bootstrap <<'EOF'
 Unattended-Upgrade::Automatic-Reboot "false";
 EOF
 
-
-systemctl enable \
-    apt-daily.timer \
-    apt-daily-upgrade.timer \
-    >/dev/null 2>&1 || true
-
-
-systemctl start \
-    apt-daily.timer \
-    apt-daily-upgrade.timer \
-    >/dev/null 2>&1 || true
-
-
-echo "Automatic Ubuntu security updates enabled."
-echo "Automatic reboots disabled."
-
+systemctl enable apt-daily.timer apt-daily-upgrade.timer >/dev/null 2>&1 || true
+systemctl start apt-daily.timer apt-daily-upgrade.timer >/dev/null 2>&1 || true
 
 # ------------------------------------------------------------------------------
-# Install Docker Engine from Docker's official repository
+# Install/reuse Docker Engine
 # ------------------------------------------------------------------------------
 
 log "DOCKER ENGINE"
-
-
-if ! dpkg-query \
-        -W \
-        -f='${Status}' \
-        docker-ce \
-        2>/dev/null |
-        grep -q 'ok installed'; then
-
-    CONFLICTING_PACKAGES=()
-
-    for package in \
-        docker.io \
-        docker-compose \
-        docker-compose-v2 \
-        docker-doc \
-        docker-buildx \
-        podman-docker \
-        containerd \
-        runc
-    do
-
-        if dpkg-query \
-            -W \
-            -f='${Status}' \
-            "$package" \
-            2>/dev/null |
-            grep -q 'ok installed'; then
-
-            CONFLICTING_PACKAGES+=("$package")
+if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
+    echo "Functional Docker installation already exists; reusing it."
+else
+    # Remove packages that conflict with Docker CE when a partial/non-working
+    # container runtime is already present. Existing Docker data under
+    # /var/lib/docker is not deleted by this package removal.
+    CONFLICTING_DOCKER_PACKAGES=()
+    for package in docker.io docker-compose docker-compose-v2 docker-doc podman-docker containerd runc; do
+        if dpkg-query -W -f='${Status}' "$package" 2>/dev/null | grep -q 'ok installed'; then
+            CONFLICTING_DOCKER_PACKAGES+=("$package")
         fi
-
     done
-
-
-    if (( ${#CONFLICTING_PACKAGES[@]} > 0 )); then
-
+    if (( ${#CONFLICTING_DOCKER_PACKAGES[@]} > 0 )); then
         echo "Removing conflicting container packages:"
-        printf '  %s\n' "${CONFLICTING_PACKAGES[@]}"
-
-        apt-get "${APT_OPTIONS[@]}" remove \
-            "${CONFLICTING_PACKAGES[@]}"
-
+        printf '  %s\n' "${CONFLICTING_DOCKER_PACKAGES[@]}"
+        wait_for_apt
+        apt-get "${APT_OPTIONS[@]}" remove "${CONFLICTING_DOCKER_PACKAGES[@]}"
     fi
-fi
 
+    install -m 0755 -d /etc/apt/keyrings
+    curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
+    chmod a+r /etc/apt/keyrings/docker.asc
 
-install \
-    -m 0755 \
-    -d \
-    /etc/apt/keyrings
+    DOCKER_CODENAME="${UBUNTU_CODENAME:-${VERSION_CODENAME:-}}"
+    [[ -n "$DOCKER_CODENAME" ]] || die "Could not determine Ubuntu codename for Docker repository."
+    DOCKER_ARCH="$(dpkg --print-architecture)"
 
-
-curl \
-    -fsSL \
-    https://download.docker.com/linux/ubuntu/gpg \
-    -o /etc/apt/keyrings/docker.asc
-
-
-chmod \
-    a+r \
-    /etc/apt/keyrings/docker.asc
-
-
-DOCKER_CODENAME="${
-    UBUNTU_CODENAME:-${VERSION_CODENAME:-}
-}"
-
-if [[ -z "$DOCKER_CODENAME" ]]; then
-    die "Could not determine Ubuntu codename for Docker repository."
-fi
-
-
-DOCKER_ARCH="$(
-    dpkg --print-architecture
-)"
-
-
-cat > /etc/apt/sources.list.d/docker.sources <<EOF
+    cat > /etc/apt/sources.list.d/docker.sources <<EOF
 Types: deb
 URIs: https://download.docker.com/linux/ubuntu
 Suites: ${DOCKER_CODENAME}
@@ -754,390 +629,742 @@ Architectures: ${DOCKER_ARCH}
 Signed-By: /etc/apt/keyrings/docker.asc
 EOF
 
-
-apt-get update
-
-
-apt-get "${APT_OPTIONS[@]}" install \
-    docker-ce \
-    docker-ce-cli \
-    containerd.io \
-    docker-buildx-plugin \
-    docker-compose-plugin
-
-
-systemctl enable \
-    --now \
-    docker
-
-
-if ! systemctl is-active \
-        --quiet \
-        docker; then
-
-    die "Docker service is not running."
+    wait_for_apt
+    apt-get update
+    wait_for_apt
+    apt-get "${APT_OPTIONS[@]}" install \
+        docker-ce \
+        docker-ce-cli \
+        containerd.io \
+        docker-buildx-plugin \
+        docker-compose-plugin
 fi
 
+systemctl enable --now docker
+systemctl is-active --quiet docker || die "Docker service is not running."
+docker info >/dev/null
 
-if ! docker info >/dev/null 2>&1; then
-    die "Docker daemon is running but docker info failed."
+echo "Docker: $(docker --version)"
+echo "Compose: $(docker compose version)"
+
+# Keep Docker logs bounded and keep containers alive across daemon upgrades when possible.
+DOCKER_DAEMON_JSON="/etc/docker/daemon.json"
+DOCKER_DAEMON_TMP="$(mktemp)"
+if [[ -s "$DOCKER_DAEMON_JSON" ]]; then
+    jq empty "$DOCKER_DAEMON_JSON" || die "$DOCKER_DAEMON_JSON contains invalid JSON."
+    jq '. + {"live-restore": true, "log-driver": "json-file", "log-opts": ((.["log-opts"] // {}) + {"max-size":"10m","max-file":"3"})}' \
+        "$DOCKER_DAEMON_JSON" > "$DOCKER_DAEMON_TMP"
+else
+    jq -n '{"live-restore": true, "log-driver":"json-file", "log-opts":{"max-size":"10m","max-file":"3"}}' \
+        > "$DOCKER_DAEMON_TMP"
 fi
 
-
-echo "Docker installed successfully."
-
-docker --version
-docker compose version
-containerd --version | head -n 1
-
+if [[ ! -f "$DOCKER_DAEMON_JSON" ]] || ! cmp -s "$DOCKER_DAEMON_TMP" "$DOCKER_DAEMON_JSON"; then
+    install -o root -g root -m 0644 "$DOCKER_DAEMON_TMP" "$DOCKER_DAEMON_JSON"
+    systemctl restart docker
+    systemctl is-active --quiet docker || die "Docker failed after daemon configuration update."
+fi
+rm -f "$DOCKER_DAEMON_TMP"
 
 # ------------------------------------------------------------------------------
-# Configure SSH hardening
+# Harden SSH
 # ------------------------------------------------------------------------------
 
-log "SSH HARDENING"
+SSH_PORT="$(sshd -T | awk '$1 == "port" {print $2; exit}')"
+[[ -n "$SSH_PORT" ]] || die "Could not determine SSH port."
 
-SSH_MAIN="/etc/ssh/sshd_config"
-SSH_DROPIN_DIR="/etc/ssh/sshd_config.d"
-SSH_DROPIN="${SSH_DROPIN_DIR}/00-vpn-bootstrap.conf"
+if [[ "$SSH_HARDENING" -eq 1 ]]; then
+    log "SSH HARDENING"
+    SSH_MAIN="/etc/ssh/sshd_config"
+    SSH_DROPIN_DIR="/etc/ssh/sshd_config.d"
+    SSH_DROPIN="$SSH_DROPIN_DIR/00-vpn-bootstrap.conf"
+    mkdir -p "$SSH_DROPIN_DIR"
 
-
-mkdir -p "$SSH_DROPIN_DIR"
-
-
-# Ensure sshd_config loads drop-in configuration files.
-# The Include directive is inserted at the beginning when missing because
-# OpenSSH generally uses the first obtained value for a setting.
-
-if ! grep -Eq \
-    '^[[:space:]]*Include[[:space:]]+/etc/ssh/sshd_config.d/\*\.conf' \
-    "$SSH_MAIN"; then
-
-    SSH_BACKUP="${
-        SSH_MAIN
-    }.vpn-bootstrap-backup.$(
-        date +%Y%m%d-%H%M%S
-    )"
-
-    cp \
-        -a \
-        "$SSH_MAIN" \
-        "$SSH_BACKUP"
-
-    SSH_TMP="$(mktemp)"
-
-    {
-        echo 'Include /etc/ssh/sshd_config.d/*.conf'
-        cat "$SSH_MAIN"
-    } > "$SSH_TMP"
-
-    install \
-        -o root \
-        -g root \
-        -m 0644 \
-        "$SSH_TMP" \
-        "$SSH_MAIN"
-
-    rm -f "$SSH_TMP"
-
-fi
-
-
-cat > "$SSH_DROPIN" <<'EOF'
+    cat > "$SSH_DROPIN" <<'EOF'
 PermitRootLogin no
-
 PubkeyAuthentication yes
 PasswordAuthentication no
 KbdInteractiveAuthentication no
 PermitEmptyPasswords no
-
 MaxAuthTries 3
-
 X11Forwarding no
 EOF
+    chmod 0644 "$SSH_DROPIN"
 
+    MANAGED_INCLUDE='Include /etc/ssh/sshd_config.d/00-vpn-bootstrap.conf'
+    if ! head -n 5 "$SSH_MAIN" | grep -qxF "$MANAGED_INCLUDE"; then
+        if [[ ! -e "${SSH_MAIN}.vpn-bootstrap-original" ]]; then
+            cp -a "$SSH_MAIN" "${SSH_MAIN}.vpn-bootstrap-original"
+        fi
+        SSH_TMP="$(mktemp)"
+        {
+            echo "$MANAGED_INCLUDE"
+            grep -vxF "$MANAGED_INCLUDE" "$SSH_MAIN"
+        } > "$SSH_TMP"
+        install -o root -g root -m 0644 "$SSH_TMP" "$SSH_MAIN"
+        rm -f "$SSH_TMP"
+    fi
 
-chmod 0644 "$SSH_DROPIN"
+    sshd -t
+    SSH_EFFECTIVE="$(sshd -T | grep -E '^(permitrootlogin|pubkeyauthentication|passwordauthentication|kbdinteractiveauthentication|permitemptypasswords|maxauthtries|x11forwarding) ')"
 
+    for expected in \
+        'permitrootlogin no' \
+        'pubkeyauthentication yes' \
+        'passwordauthentication no' \
+        'kbdinteractiveauthentication no' \
+        'permitemptypasswords no' \
+        'maxauthtries 3' \
+        'x11forwarding no'
+    do
+        grep -qxF "$expected" <<< "$SSH_EFFECTIVE" || {
+            echo "$SSH_EFFECTIVE"
+            die "Expected SSH setting is not effective: $expected"
+        }
+    done
 
-# Validate complete SSH configuration before reloading sshd.
+    systemctl reload ssh
+    systemctl is-active --quiet ssh || die "SSH service is not running after reload."
+    echo "$SSH_EFFECTIVE"
+else
+    log "SSH HARDENING SKIPPED"
+fi
 
-sshd -t
+# ------------------------------------------------------------------------------
+# Detect server networking
+# ------------------------------------------------------------------------------
 
+log "NETWORK DETECTION"
+SERVER_IPV4="$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}')"
+[[ -n "$SERVER_IPV4" ]] || die "Could not detect the server IPv4 address."
 
-SSH_EFFECTIVE="$(
-    sshd -T |
-    grep -E \
-        '^(permitrootlogin|pubkeyauthentication|passwordauthentication|kbdinteractiveauthentication|permitemptypasswords|maxauthtries|x11forwarding) '
-)"
+IPV6_EGRESS_OK=0
+SERVER_IPV6=""
+if curl -6 -fsS --max-time 6 https://api64.ipify.org >/tmp/vpn-bootstrap-ipv6 2>/dev/null; then
+    SERVER_IPV6="$(tr -d '\r\n' </tmp/vpn-bootstrap-ipv6)"
+    if [[ "$SERVER_IPV6" == *:* ]]; then
+        IPV6_EGRESS_OK=1
+    else
+        SERVER_IPV6=""
+    fi
+fi
+rm -f /tmp/vpn-bootstrap-ipv6
 
+if [[ "$IPV6_EGRESS_OK" -eq 1 ]]; then
+    echo "IPv4: $SERVER_IPV4"
+    echo "IPv6: $SERVER_IPV6 (outbound connectivity OK)"
+else
+    echo "IPv4: $SERVER_IPV4"
+    echo "IPv6: unavailable or outbound connectivity is not working"
+fi
 
-verify_ssh_setting() {
+# ------------------------------------------------------------------------------
+# Initialize/preserve persistent Xray state
+# ------------------------------------------------------------------------------
 
-    local expected="$1"
+log "XRAY STATE"
+install -d -o root -g root -m 0700 "$VPN_ROOT" "$XRAY_DIR"
+touch "$LOCK_FILE"
+chmod 0600 "$LOCK_FILE"
 
-    if ! grep \
-        -qx \
-        "$expected" \
-        <<< "$SSH_EFFECTIVE"; then
+if [[ ! -f "$USERS_FILE" ]]; then
+    printf '{"users":[]}\n' > "$USERS_FILE"
+    chmod 0600 "$USERS_FILE"
+else
+    jq -e '.users | type == "array"' "$USERS_FILE" >/dev/null || die "$USERS_FILE is invalid."
+fi
 
-        echo
-        echo "Effective sshd configuration:"
-        echo "$SSH_EFFECTIVE"
+if [[ -f "$STATE_FILE" ]]; then
+    jq empty "$STATE_FILE" || die "$STATE_FILE contains invalid JSON."
+    XRAY_IMAGE="$(jq -r '.xray_image' "$STATE_FILE")"
+    XRAY_PORT="$(jq -r '.xray_port' "$STATE_FILE")"
+    REALITY_TARGET="$(jq -r '.reality_target' "$STATE_FILE")"
+    REALITY_PRIVATE_KEY="$(jq -r '.reality_private_key' "$STATE_FILE")"
+    REALITY_PUBLIC_KEY="$(jq -r '.reality_public_key' "$STATE_FILE")"
+    ENDPOINT_MODE="$(jq -r '.endpoint_mode // "auto"' "$STATE_FILE")"
+    ENDPOINT_HOST="$(jq -r '.endpoint_host' "$STATE_FILE")"
+    BLOCK_RU="$(jq -r '.block_ru' "$STATE_FILE")"
 
-        die "Expected SSH setting is not effective: $expected"
+    [[ -n "$XRAY_IMAGE" && "$XRAY_IMAGE" != "null" ]] || die "Missing xray_image in state."
+    is_valid_port "$XRAY_PORT" || die "Invalid xray_port in state."
+    [[ -n "$REALITY_PRIVATE_KEY" && "$REALITY_PRIVATE_KEY" != "null" ]] || die "Missing REALITY private key in state."
+    [[ -n "$REALITY_PUBLIC_KEY" && "$REALITY_PUBLIC_KEY" != "null" ]] || die "Missing REALITY public key in state."
+
+    if [[ -n "$XRAY_IMAGE_ARG" ]]; then XRAY_IMAGE="$XRAY_IMAGE_ARG"; fi
+    if [[ -n "$XRAY_PORT_ARG" ]]; then XRAY_PORT="$XRAY_PORT_ARG"; fi
+    if [[ -n "$REALITY_TARGET_ARG" ]]; then REALITY_TARGET="$REALITY_TARGET_ARG"; fi
+    if [[ -n "$BLOCK_RU_ARG" ]]; then BLOCK_RU="$BLOCK_RU_ARG"; fi
+    if [[ -n "$ENDPOINT_ARG" ]]; then
+        ENDPOINT_MODE="manual"
+        ENDPOINT_HOST="$ENDPOINT_ARG"
+    elif [[ "$ENDPOINT_MODE" == "auto" ]]; then
+        ENDPOINT_HOST="$SERVER_IPV4"
+    fi
+
+    echo "Existing REALITY keys and VPN users preserved."
+else
+    XRAY_IMAGE="${XRAY_IMAGE_ARG:-$DEFAULT_XRAY_IMAGE}"
+    XRAY_PORT="${XRAY_PORT_ARG:-$DEFAULT_XRAY_PORT}"
+    REALITY_TARGET="${REALITY_TARGET_ARG:-$DEFAULT_REALITY_TARGET}"
+    BLOCK_RU="${BLOCK_RU_ARG:-true}"
+
+    if [[ -n "$ENDPOINT_ARG" ]]; then
+        ENDPOINT_MODE="manual"
+        ENDPOINT_HOST="$ENDPOINT_ARG"
+    else
+        ENDPOINT_MODE="auto"
+        ENDPOINT_HOST="$SERVER_IPV4"
+    fi
+
+    docker pull "$XRAY_IMAGE"
+    KEY_OUTPUT="$(docker run --rm "$XRAY_IMAGE" x25519)"
+    REALITY_PRIVATE_KEY="$(awk -F': ' '/^PrivateKey:/ {print $2; exit}' <<< "$KEY_OUTPUT")"
+    REALITY_PUBLIC_KEY="$(awk -F': ' '/^Password \(PublicKey\):/ {print $2; exit} /^PublicKey:/ {print $2; exit}' <<< "$KEY_OUTPUT")"
+    [[ -n "$REALITY_PRIVATE_KEY" ]] || die "Could not generate REALITY private key."
+    [[ -n "$REALITY_PUBLIC_KEY" ]] || die "Could not generate REALITY public key."
+    echo "Generated persistent REALITY keypair."
+fi
+
+is_valid_port "$XRAY_PORT" || die "Invalid Xray port: $XRAY_PORT"
+is_valid_hostname_or_ip "$ENDPOINT_HOST" || die "Invalid endpoint host: $ENDPOINT_HOST"
+is_valid_hostname_or_ip "$REALITY_TARGET" || die "Invalid REALITY target: $REALITY_TARGET"
+[[ "$REALITY_TARGET" != *:* ]] || die "REALITY target must be a hostname without a port."
+[[ "$BLOCK_RU" == "true" || "$BLOCK_RU" == "false" ]] || die "Invalid block_ru state."
+
+STATE_TMP="$(mktemp)"
+jq -n \
+    --arg image "$XRAY_IMAGE" \
+    --argjson port "$XRAY_PORT" \
+    --arg target "$REALITY_TARGET" \
+    --arg private_key "$REALITY_PRIVATE_KEY" \
+    --arg public_key "$REALITY_PUBLIC_KEY" \
+    --arg endpoint_mode "$ENDPOINT_MODE" \
+    --arg endpoint_host "$ENDPOINT_HOST" \
+    --argjson block_ru "$BLOCK_RU" \
+    --arg server_ipv4 "$SERVER_IPV4" \
+    --arg server_ipv6 "$SERVER_IPV6" \
+    --argjson ipv6_ok "$(json_bool "$IPV6_EGRESS_OK")" \
+    '{
+        xray_image:$image,
+        xray_port:$port,
+        reality_target:$target,
+        reality_private_key:$private_key,
+        reality_public_key:$public_key,
+        endpoint_mode:$endpoint_mode,
+        endpoint_host:$endpoint_host,
+        block_ru:$block_ru,
+        server_ipv4:$server_ipv4,
+        server_ipv6:$server_ipv6,
+        ipv6_egress_ok:$ipv6_ok
+    }' > "$STATE_TMP"
+install -o root -g root -m 0600 "$STATE_TMP" "$STATE_FILE"
+rm -f "$STATE_TMP"
+
+# ------------------------------------------------------------------------------
+# Check pinned Xray version against the latest stable GitHub release
+# ------------------------------------------------------------------------------
+
+log "XRAY VERSION CHECK"
+check_xray_version "$XRAY_IMAGE"
+
+# ------------------------------------------------------------------------------
+# Validate REALITY camouflage target
+# ------------------------------------------------------------------------------
+
+log "REALITY TARGET CHECK"
+if timeout 12 openssl s_client \
+    -connect "${REALITY_TARGET}:443" \
+    -servername "$REALITY_TARGET" \
+    -tls1_3 \
+    -brief </dev/null 2>&1 | grep -q 'TLSv1.3'; then
+    echo "REALITY target supports TLS 1.3: $REALITY_TARGET"
+else
+    die "REALITY target failed the TLS 1.3 check: $REALITY_TARGET. Use --reality-target HOST."
+fi
+
+# ------------------------------------------------------------------------------
+# Install renderer and management command
+# ------------------------------------------------------------------------------
+
+log "VPN MANAGEMENT COMMANDS"
+install -d -o root -g root -m 0755 /usr/local/libexec
+
+cat > /usr/local/libexec/vpn-render-xray <<'RENDER'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+VPN_ROOT="/opt/vpn-stack"
+XRAY_DIR="$VPN_ROOT/xray"
+STATE_FILE="$VPN_ROOT/state.json"
+USERS_FILE="$VPN_ROOT/users.json"
+COMPOSE_FILE="$VPN_ROOT/compose.yml"
+XRAY_CONTAINER="xray-reality"
+
+[[ $EUID -eq 0 ]] || { echo "ERROR: run as root" >&2; exit 1; }
+jq empty "$STATE_FILE"
+jq -e '.users | type == "array"' "$USERS_FILE" >/dev/null
+
+XRAY_IMAGE="$(jq -r '.xray_image' "$STATE_FILE")"
+XRAY_PORT="$(jq -r '.xray_port' "$STATE_FILE")"
+REALITY_TARGET="$(jq -r '.reality_target' "$STATE_FILE")"
+REALITY_PRIVATE_KEY="$(jq -r '.reality_private_key' "$STATE_FILE")"
+BLOCK_RU="$(jq -r '.block_ru' "$STATE_FILE")"
+IPV6_OK="$(jq -r '.ipv6_egress_ok' "$STATE_FILE")"
+
+if [[ -r /proc/sys/net/ipv6/conf/all/disable_ipv6 ]] && [[ "$(cat /proc/sys/net/ipv6/conf/all/disable_ipv6)" == "0" ]]; then
+    LISTEN_ADDR="::"
+else
+    LISTEN_ADDR="0.0.0.0"
+fi
+
+if [[ "$IPV6_OK" == "true" ]]; then
+    FREEDOM_STRATEGY="UseIPv6v4"
+else
+    FREEDOM_STRATEGY="UseIPv4"
+fi
+
+CONFIG_TMP="$(mktemp)"
+trap 'rm -f "$CONFIG_TMP"' EXIT
+
+jq -n \
+    --arg listen "$LISTEN_ADDR" \
+    --argjson port "$XRAY_PORT" \
+    --arg target "$REALITY_TARGET" \
+    --arg private_key "$REALITY_PRIVATE_KEY" \
+    --arg freedom_strategy "$FREEDOM_STRATEGY" \
+    --argjson block_ru "$BLOCK_RU" \
+    --slurpfile db "$USERS_FILE" '
+    ($db[0].users) as $u |
+    ($u | map({id:.uuid, email:.name, flow:"xtls-rprx-vision"})) as $clients |
+    (if ($u|length) == 0 then [""] else ($u | map(.sid)) end) as $short_ids |
+    {
+      log: {loglevel:"warning"},
+      inbounds: [
+        {
+          tag:"vless-reality",
+          listen:$listen,
+          port:$port,
+          protocol:"vless",
+          settings:{
+            users:$clients,
+            decryption:"none"
+          },
+          streamSettings:{
+            network:"raw",
+            security:"reality",
+            realitySettings:{
+              show:false,
+              target:($target + ":443"),
+              xver:0,
+              serverNames:[$target],
+              privateKey:$private_key,
+              shortIds:$short_ids
+            }
+          },
+          sniffing:{
+            enabled:true,
+            destOverride:["http","tls","quic"],
+            routeOnly:true
+          }
+        }
+      ],
+      outbounds:[
+        {
+          tag:"direct",
+          protocol:"freedom",
+          settings:{domainStrategy:$freedom_strategy}
+        },
+        {
+          tag:"block",
+          protocol:"blackhole"
+        }
+      ],
+      routing:{
+        domainStrategy:"IPIfNonMatch",
+        rules:(
+          if $block_ru then
+            [
+              {
+                type:"field",
+                domain:["regexp:(?i)(^|\\.)(ru|su|xn--p1ai)$"],
+                outboundTag:"block"
+              },
+              {
+                type:"field",
+                ip:["geoip:ru"],
+                outboundTag:"block"
+              }
+            ]
+          else [] end
+        )
+      }
+    }
+    ' > "$CONFIG_TMP"
+
+# Validate the new configuration before replacing the live one.
+docker pull "$XRAY_IMAGE" >/dev/null
+docker run --rm \
+    --network none \
+    -v "$CONFIG_TMP:/etc/xray/config.json:ro" \
+    "$XRAY_IMAGE" \
+    run -test -config /etc/xray/config.json >/dev/null
+
+install -o root -g root -m 0600 "$CONFIG_TMP" "$XRAY_DIR/config.json"
+
+cat > "$COMPOSE_FILE" <<EOF
+services:
+  xray:
+    image: ${XRAY_IMAGE}
+    container_name: ${XRAY_CONTAINER}
+    network_mode: host
+    restart: always
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    volumes:
+      - ./xray/config.json:/etc/xray/config.json:ro
+    command: ["run", "-config", "/etc/xray/config.json"]
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+EOF
+chmod 0600 "$COMPOSE_FILE"
+
+cd "$VPN_ROOT"
+docker compose -f "$COMPOSE_FILE" up -d --remove-orphans
+
+for _ in $(seq 1 20); do
+    if docker inspect -f '{{.State.Running}}' "$XRAY_CONTAINER" 2>/dev/null | grep -qx true; then
+        sleep 1
+        exit 0
+    fi
+    sleep 1
+done
+
+echo "ERROR: Xray did not become healthy." >&2
+docker logs --tail 100 "$XRAY_CONTAINER" >&2 || true
+exit 1
+RENDER
+chmod 0700 /usr/local/libexec/vpn-render-xray
+
+cat > /usr/local/sbin/vpnctl <<'VPNCTL'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+VPN_ROOT="/opt/vpn-stack"
+STATE_FILE="$VPN_ROOT/state.json"
+USERS_FILE="$VPN_ROOT/users.json"
+LOCK_FILE="$VPN_ROOT/.lock"
+XRAY_CONTAINER="xray-reality"
+
+[[ $EUID -eq 0 ]] || { echo "ERROR: use sudo" >&2; exit 1; }
+
+url_host() {
+    local host="$1"
+    if [[ "$host" == *:* && "$host" != \[*\] ]]; then
+        printf '[%s]' "$host"
+    else
+        printf '%s' "$host"
     fi
 }
 
+load_state() {
+    XRAY_IMAGE="$(jq -r '.xray_image' "$STATE_FILE")"
+    XRAY_PORT="$(jq -r '.xray_port' "$STATE_FILE")"
+    ENDPOINT_HOST="$(jq -r '.endpoint_host' "$STATE_FILE")"
+    REALITY_TARGET="$(jq -r '.reality_target' "$STATE_FILE")"
+    REALITY_PUBLIC_KEY="$(jq -r '.reality_public_key' "$STATE_FILE")"
+    SERVER_IPV6="$(jq -r '.server_ipv6 // ""' "$STATE_FILE")"
+    IPV6_OK="$(jq -r '.ipv6_egress_ok // false' "$STATE_FILE")"
+    BLOCK_RU="$(jq -r '.block_ru' "$STATE_FILE")"
+}
 
-verify_ssh_setting \
-    'permitrootlogin no'
+validate_name() {
+    [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ ]] || {
+        echo "ERROR: name must match [A-Za-z0-9][A-Za-z0-9._-]{0,63}" >&2
+        exit 1
+    }
+}
 
-verify_ssh_setting \
-    'pubkeyauthentication yes'
+build_link() {
+    local name="$1" uuid="$2" sid="$3" host="$4"
+    host="$(url_host "$host")"
+    printf 'vless://%s@%s:%s?encryption=none&flow=xtls-rprx-vision&security=reality&sni=%s&fp=chrome&pbk=%s&sid=%s&type=tcp#%s\n' \
+        "$uuid" "$host" "$XRAY_PORT" "$REALITY_TARGET" "$REALITY_PUBLIC_KEY" "$sid" "$name"
+}
 
-verify_ssh_setting \
-    'passwordauthentication no'
+show_user() {
+    local name="$1"
+    load_state
+    local row uuid sid
+    row="$(jq -c --arg n "$name" '.users[]? | select(.name==$n)' "$USERS_FILE" | head -n 1)"
+    [[ -n "$row" ]] || { echo "ERROR: user not found: $name" >&2; exit 1; }
+    uuid="$(jq -r '.uuid' <<< "$row")"
+    sid="$(jq -r '.sid' <<< "$row")"
 
-verify_ssh_setting \
-    'kbdinteractiveauthentication no'
+    echo "Primary link:"
+    build_link "$name" "$uuid" "$sid" "$ENDPOINT_HOST"
 
-verify_ssh_setting \
-    'permitemptypasswords no'
+    if [[ "$IPV6_OK" == "true" && -n "$SERVER_IPV6" && "$ENDPOINT_HOST" != "$SERVER_IPV6" ]]; then
+        echo
+        echo "Direct IPv6 link:"
+        build_link "${name}-IPv6" "$uuid" "$sid" "$SERVER_IPV6"
+    fi
+}
 
-verify_ssh_setting \
-    'maxauthtries 3'
+add_user() {
+    local name="$1"
+    validate_name "$name"
+    exec 9>"$LOCK_FILE"
+    flock -x 9
+    load_state
 
-verify_ssh_setting \
-    'x11forwarding no'
-
-
-systemctl reload ssh
-
-
-if ! systemctl is-active \
-        --quiet \
-        ssh; then
-
-    die "SSH service is not running after configuration reload."
-fi
-
-
-echo "$SSH_EFFECTIVE"
-
-
-# ------------------------------------------------------------------------------
-# Network diagnostics
-# ------------------------------------------------------------------------------
-
-log "NETWORK"
-
-
-echo "--- IPv4 addresses ---"
-ip -4 -br addr || true
-
-echo
-echo "--- IPv4 routes ---"
-ip -4 route || true
-
-
-echo
-echo "--- IPv6 addresses ---"
-ip -6 -br addr || true
-
-echo
-echo "--- IPv6 routes ---"
-ip -6 route || true
-
-
-SERVER_IPV4="$(
-    ip \
-        -4 \
-        route get \
-        1.1.1.1 \
-        2>/dev/null |
-    awk '
-        {
-            for (i = 1; i <= NF; i++) {
-                if ($i == "src") {
-                    print $(i + 1)
-                    exit
-                }
-            }
-        }
-    '
-)"
-
-
-GLOBAL_IPV6="$(
-    ip \
-        -6 \
-        -o \
-        addr show \
-        scope global \
-        2>/dev/null |
-    awk '
-        {
-            print $4
-            exit
-        }
-    '
-)"
-
-
-echo
-echo "--- IPv6 connectivity ---"
-
-if [[ -n "$GLOBAL_IPV6" ]]; then
-
-    echo "Global IPv6 address: $GLOBAL_IPV6"
-
-    if ping \
-        -6 \
-        -c 2 \
-        -W 2 \
-        2606:4700:4700::1111 \
-        >/dev/null 2>&1; then
-
-        echo "IPv6 outbound connectivity: OK"
-
-    else
-
-        echo "IPv6 outbound connectivity: NOT WORKING"
-
+    if jq -e --arg n "$name" '.users[]? | select(.name==$n)' "$USERS_FILE" >/dev/null; then
+        echo "User already exists: $name"
+        show_user "$name"
+        return 0
     fi
 
-else
+    local uuid sid tmp backup
+    uuid="$(docker run --rm "$XRAY_IMAGE" uuid | tail -n 1 | tr -d '\r\n')"
+    [[ -n "$uuid" ]] || { echo "ERROR: UUID generation failed" >&2; exit 1; }
+    sid="$(openssl rand -hex 8)"
+    tmp="$(mktemp)"
+    backup="${USERS_FILE}.bak"
+    cp -a "$USERS_FILE" "$backup"
 
-    echo "No global IPv6 address configured."
+    jq --arg n "$name" --arg u "$uuid" --arg s "$sid" \
+        '.users += [{name:$n,uuid:$u,sid:$s}]' "$USERS_FILE" > "$tmp"
+    install -o root -g root -m 0600 "$tmp" "$USERS_FILE"
+    rm -f "$tmp"
 
-fi
+    if ! /usr/local/libexec/vpn-render-xray; then
+        cp -a "$backup" "$USERS_FILE"
+        /usr/local/libexec/vpn-render-xray || true
+        echo "ERROR: user creation rolled back" >&2
+        exit 1
+    fi
+    rm -f "$backup"
 
-
-# ------------------------------------------------------------------------------
-# Check ports needed by the future VPN services
-# ------------------------------------------------------------------------------
-
-log "VPN PORT PRE-CHECK"
-
-
-if ss -ltnH |
-    awk '{print $4}' |
-    grep -Eq '(^|:|\])443$'; then
-
-    echo "WARNING: TCP/443 is already occupied:"
-    ss -ltnp | grep ':443 ' || true
-
-else
-
-    echo "TCP/443: FREE"
-
-fi
-
-
-# ------------------------------------------------------------------------------
-# Final system information
-# ------------------------------------------------------------------------------
-
-log "RESOURCE SUMMARY"
-
-free -h
-
-echo
-swapon --show || true
-
-echo
-df -h /
-
-
-log "DOCKER SUMMARY"
-
-docker info \
-    --format \
-    'Server Version: {{.ServerVersion}}
-Storage Driver: {{.Driver}}
-Cgroup Driver: {{.CgroupDriver}}
-Containers: {{.Containers}}
-Images: {{.Images}}'
-
-
-log "SSH SUMMARY"
-
-SSH_PORT="$(
-    sshd -T |
-    awk '
-        $1 == "port" {
-            print $2
-            exit
-        }
-    '
-)"
-
-echo "VPN management user : $VPN_USER"
-echo "SSH port            : ${SSH_PORT:-unknown}"
-echo "IPv4                : ${SERVER_IPV4:-unknown}"
-echo "IPv6                : ${GLOBAL_IPV6:-none}"
-echo
-echo "$SSH_EFFECTIVE"
-
-
-# ------------------------------------------------------------------------------
-# Reboot state
-# ------------------------------------------------------------------------------
-
-log "BOOTSTRAP RESULT"
-
-echo "VPN server bootstrap completed successfully."
-echo
-echo "SSH root login         : disabled"
-echo "SSH password login     : disabled"
-echo "SSH public-key login   : enabled"
-echo "VPN management user    : $VPN_USER"
-echo "Passwordless sudo      : enabled"
-echo "Docker Engine          : installed"
-echo "Automatic sec. updates : enabled"
-echo "Automatic reboot       : disabled"
-
-if swapon --show --noheadings | grep -q .; then
-    echo "Swap                  : enabled"
-else
-    echo "Swap                  : disabled"
-fi
-
-
-if [[ -f /var/run/reboot-required ]]; then
-
+    echo "Created VPN user/device: $name"
+    echo "Note: applying user changes performs a short controlled Xray restart."
     echo
-    echo "REBOOT REQUIRED:"
-    echo "Ubuntu installed updates that require a reboot."
-    echo "The script intentionally does not reboot the server automatically."
+    show_user "$name"
+    echo
+    echo "QR code for the primary link:"
+    build_link "$name" "$uuid" "$sid" "$ENDPOINT_HOST" | qrencode -t ANSIUTF8
+    echo
+    echo "Treat VLESS links and QR codes as credentials."
+}
 
+remove_user() {
+    local name="$1"
+    validate_name "$name"
+    exec 9>"$LOCK_FILE"
+    flock -x 9
+
+    if ! jq -e --arg n "$name" '.users[]? | select(.name==$n)' "$USERS_FILE" >/dev/null; then
+        echo "User does not exist: $name"
+        return 0
+    fi
+
+    local tmp backup
+    tmp="$(mktemp)"
+    backup="${USERS_FILE}.bak"
+    cp -a "$USERS_FILE" "$backup"
+    jq --arg n "$name" '.users |= map(select(.name != $n))' "$USERS_FILE" > "$tmp"
+    install -o root -g root -m 0600 "$tmp" "$USERS_FILE"
+    rm -f "$tmp"
+
+    if ! /usr/local/libexec/vpn-render-xray; then
+        cp -a "$backup" "$USERS_FILE"
+        /usr/local/libexec/vpn-render-xray || true
+        echo "ERROR: user removal rolled back" >&2
+        exit 1
+    fi
+    rm -f "$backup"
+    echo "Removed VPN user/device: $name"
+}
+
+list_users() {
+    jq -r '.users[].name' "$USERS_FILE"
+}
+
+status() {
+    load_state
+    echo "Xray container:"
+    docker ps --filter "name=^/${XRAY_CONTAINER}$" --format '  {{.Names}}  {{.Status}}  {{.Image}}'
+    echo
+    echo "Listener:"
+    ss -ltnp | grep -E ":${XRAY_PORT}[[:space:]]" || true
+    echo
+    echo "Configuration:"
+    echo "  Endpoint:       $ENDPOINT_HOST:$XRAY_PORT"
+    echo "  REALITY target: $REALITY_TARGET"
+    echo "  RU blocking:    $BLOCK_RU"
+    echo "  IPv6 egress:    $IPV6_OK"
+    echo "  VPN users:      $(jq '.users | length' "$USERS_FILE")"
+    echo
+    echo "Memory:"
+    free -h
+}
+
+COMMAND="${1:-}"
+shift || true
+
+case "$COMMAND" in
+    add-user)
+        [[ $# -eq 1 ]] || { echo "Usage: sudo vpn-add-user NAME" >&2; exit 2; }
+        add_user "$1"
+        ;;
+    remove-user)
+        [[ $# -eq 1 ]] || { echo "Usage: sudo vpn-remove-user NAME" >&2; exit 2; }
+        remove_user "$1"
+        ;;
+    show-user)
+        [[ $# -eq 1 ]] || { echo "Usage: sudo vpn-show-user NAME" >&2; exit 2; }
+        show_user "$1"
+        ;;
+    list-users)
+        [[ $# -eq 0 ]] || { echo "Usage: sudo vpn-list-users" >&2; exit 2; }
+        list_users
+        ;;
+    status)
+        [[ $# -eq 0 ]] || { echo "Usage: sudo vpn-status" >&2; exit 2; }
+        status
+        ;;
+    *)
+        echo "Usage: sudo vpnctl {add-user|remove-user|show-user|list-users|status} [NAME]" >&2
+        exit 2
+        ;;
+esac
+VPNCTL
+chmod 0700 /usr/local/sbin/vpnctl
+
+cat > /usr/local/sbin/vpn-add-user <<'EOF'
+#!/usr/bin/env bash
+exec /usr/local/sbin/vpnctl add-user "$@"
+EOF
+cat > /usr/local/sbin/vpn-remove-user <<'EOF'
+#!/usr/bin/env bash
+exec /usr/local/sbin/vpnctl remove-user "$@"
+EOF
+cat > /usr/local/sbin/vpn-show-user <<'EOF'
+#!/usr/bin/env bash
+exec /usr/local/sbin/vpnctl show-user "$@"
+EOF
+cat > /usr/local/sbin/vpn-list-users <<'EOF'
+#!/usr/bin/env bash
+exec /usr/local/sbin/vpnctl list-users "$@"
+EOF
+cat > /usr/local/sbin/vpn-status <<'EOF'
+#!/usr/bin/env bash
+exec /usr/local/sbin/vpnctl status "$@"
+EOF
+chmod 0700 /usr/local/sbin/vpn-add-user /usr/local/sbin/vpn-remove-user \
+    /usr/local/sbin/vpn-show-user /usr/local/sbin/vpn-list-users /usr/local/sbin/vpn-status
+
+# ------------------------------------------------------------------------------
+# Check port ownership before starting/reconfiguring Xray
+# ------------------------------------------------------------------------------
+
+log "XRAY PORT CHECK"
+if ss -ltnH | awk '{print $4}' | grep -Eq "(^|:|\\])${XRAY_PORT}$"; then
+    if docker ps --format '{{.Names}}' | grep -qx "$XRAY_CONTAINER"; then
+        echo "TCP/$XRAY_PORT is already owned by the existing Xray deployment."
+    else
+        echo "TCP/$XRAY_PORT is already occupied:"
+        ss -ltnp | grep -E ":${XRAY_PORT}[[:space:]]" || true
+        die "Choose another --xray-port or free TCP/$XRAY_PORT."
+    fi
+else
+    echo "TCP/$XRAY_PORT is free."
 fi
 
+# ------------------------------------------------------------------------------
+# Render, validate and start Xray
+# ------------------------------------------------------------------------------
 
+log "XRAY DEPLOYMENT"
+/usr/local/libexec/vpn-render-xray
+
+docker inspect -f '{{.State.Running}}' "$XRAY_CONTAINER" | grep -qx true || die "Xray container is not running."
+
+# Verify IPv4 reachability of the local listener. On Ubuntu, an [::] wildcard
+# listener is normally dual-stack and accepts both IPv4 and IPv6.
+if ! nc -4 -z -w 2 127.0.0.1 "$XRAY_PORT"; then
+    docker logs --tail 100 "$XRAY_CONTAINER" || true
+    die "Xray is running but is not accepting IPv4 connections on TCP/$XRAY_PORT."
+fi
+
+echo "Xray is accepting IPv4 TCP connections on port $XRAY_PORT."
+if nc -6 -z -w 2 ::1 "$XRAY_PORT" >/dev/null 2>&1; then
+    echo "Xray local IPv6 listener: OK"
+else
+    echo "Xray local IPv6 listener: unavailable"
+fi
+
+# ------------------------------------------------------------------------------
+# Configure UFW after SSH and Xray ports are known
+# ------------------------------------------------------------------------------
+
+if [[ "$CONFIGURE_FIREWALL" -eq 1 ]]; then
+    log "FIREWALL"
+    sed -i 's/^IPV6=.*/IPV6=yes/' /etc/default/ufw
+    ufw default deny incoming >/dev/null
+    ufw default allow outgoing >/dev/null
+    ufw allow "${SSH_PORT}/tcp" comment 'SSH' >/dev/null
+    ufw allow "${XRAY_PORT}/tcp" comment 'Xray REALITY' >/dev/null
+    ufw --force enable >/dev/null
+    ufw status verbose
+else
+    log "FIREWALL SKIPPED"
+fi
+
+# ------------------------------------------------------------------------------
+# Final checks and summary
+# ------------------------------------------------------------------------------
+
+log "FINAL CHECKS"
+/usr/local/sbin/vpn-status
+
+echo
+if [[ -f /var/run/reboot-required ]]; then
+    warn "Ubuntu reports that a reboot is required after package updates."
+    warn "The script intentionally did not reboot the server."
+fi
+
+echo
+echo "============================================================"
+echo "VPN BOOTSTRAP COMPLETE"
+echo "============================================================"
+echo "VPN management user : $VPN_USER"
+echo "SSH port            : $SSH_PORT"
+echo "Client endpoint      : $ENDPOINT_HOST:$XRAY_PORT"
+echo "Protocol             : VLESS + XTLS Vision + REALITY"
+echo "REALITY target       : $REALITY_TARGET"
+echo "RU destinations      : $([[ "$BLOCK_RU" == "true" ]] && echo BLOCKED || echo ALLOWED)"
+echo "IPv6 egress          : $([[ "$IPV6_EGRESS_OK" -eq 1 ]] && echo ENABLED || echo UNAVAILABLE)"
+echo "VPN users            : $(jq '.users | length' "$USERS_FILE")"
+echo
+echo "Xray runs continuously in Docker."
+echo "Docker starts at boot and the Xray container uses restart: always,"
+echo "so it is restarted automatically after a crash or server reboot."
+echo
+echo "No VPN user was created automatically."
+echo "Create one device/user with:"
+echo "    sudo vpn-add-user phone"
+echo
+echo "Other commands:"
+echo "    sudo vpn-add-user NAME"
+echo "    sudo vpn-remove-user NAME"
+echo "    sudo vpn-show-user NAME"
+echo "    sudo vpn-list-users"
+echo "    sudo vpn-status"
 echo
 echo "IMPORTANT:"
-echo "Before closing your current SSH session, verify a new login:"
-echo
-
-if [[ -n "$SERVER_IPV4" ]]; then
-
-    if [[ "$SSH_PORT" == "22" ]]; then
-        echo "    ssh ${VPN_USER}@${SERVER_IPV4}"
-    else
-        echo "    ssh -p ${SSH_PORT} ${VPN_USER}@${SERVER_IPV4}"
-    fi
-
-else
-
-    echo "    ssh ${VPN_USER}@SERVER_IP"
-
-fi
-
-echo
-echo "Then verify privileges with:"
-echo
-echo "    sudo id"
-echo
-echo "Expected result: uid=0(root)"
-echo
+echo "Before closing your current SSH session, verify a new SSH login as $VPN_USER."
+echo "Treat every vless:// link and QR code as a credential."
+echo "============================================================"
