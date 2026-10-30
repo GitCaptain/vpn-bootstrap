@@ -6,7 +6,7 @@ set -Eeuo pipefail
 #
 # Installs and maintains:
 #   - VPN management user with SSH public-key access and passwordless sudo
-#   - SSH hardening (no root login, no password login)
+#   - Explicit second-step SSH hardening after testing the management login
 #   - Optional swap (default: approximately equal to installed RAM)
 #   - Unattended Ubuntu security updates (without automatic reboot)
 #   - Docker Engine from Docker's official repository
@@ -22,7 +22,8 @@ set -Eeuo pipefail
 #   - Existing active swap is preserved.
 #   - Existing Docker installation is reused if functional.
 #   - Xray configuration is regenerated from persistent state without rotating keys.
-#   - Re-running the same command is safe.
+#   - Re-running preserves credentials; configuration changes recreate Xray briefly.
+#   - Package, user, swap and firewall changes are NOT a full system transaction.
 #
 # The script never reboots the server and never upgrades Ubuntu to another release.
 #
@@ -42,7 +43,8 @@ set -Eeuo pipefail
 #   --block-ru                Enable RU destination blocking (default on first install).
 #   --no-block-ru             Disable RU destination blocking.
 #   --no-firewall             Do not configure/enable UFW.
-#   --no-ssh-hardening        Do not change SSH authentication policy.
+#   --harden-ssh              Second step: run via sudo from the management user.
+#   --no-ssh-hardening        Keep SSH authentication unchanged (the default).
 #   --skip-package-upgrade    Skip apt-get upgrade.
 #   --help
 #
@@ -72,7 +74,7 @@ REALITY_TARGET_ARG=""
 XRAY_IMAGE_ARG=""
 BLOCK_RU_ARG=""
 CONFIGURE_FIREWALL=1
-SSH_HARDENING=1
+SSH_HARDENING=0
 PACKAGE_UPGRADE=1
 
 DEFAULT_XRAY_PORT=443
@@ -118,7 +120,9 @@ Options:
                               Enabled by default on first install.
   --no-block-ru               Disable RU destination blocking.
   --no-firewall               Do not configure or enable UFW.
-  --no-ssh-hardening          Do not change SSH authentication policy.
+  --harden-ssh                Second step, after testing a new management-user SSH login.
+                              Must be run via sudo as that user; disables root/password login.
+  --no-ssh-hardening          Leave SSH authentication unchanged (default).
   --skip-package-upgrade      Skip apt-get upgrade.
   --help, -h                  Show this help and exit.
 
@@ -152,7 +156,7 @@ json_bool() {
 }
 
 is_valid_port() {
-    [[ "$1" =~ ^[0-9]+$ ]] && (( "$1" >= 1 && "$1" <= 65535 ))
+    [[ "$1" =~ ^[1-9][0-9]{0,4}$ ]] && (( 10#$1 <= 65535 ))
 }
 
 is_valid_username() {
@@ -161,11 +165,8 @@ is_valid_username() {
 
 is_valid_hostname_or_ip() {
     local value="$1"
-    [[ -n "$value" ]] || return 1
-    [[ "$value" != *"://"* ]] || return 1
-    [[ "$value" != *"/"* ]] || return 1
-    [[ "$value" != *" "* ]] || return 1
-    return 0
+    # Hostnames, IPv4 and unbracketed IPv6 only; exclude URL/YAML metacharacters.
+    [[ -n "$value" && "$value" =~ ^[A-Za-z0-9][A-Za-z0-9.:-]*$ ]]
 }
 
 url_host() {
@@ -266,15 +267,51 @@ check_xray_version() {
     fi
 }
 
+STATE_BACKUP_DIR=""
+STATE_TRANSACTION=0
+SSH_BACKUP_DIR=""
+SSH_TRANSACTION=0
+IPV6_PROBE_FILE=""
+
+rollback_pending() {
+    if [[ "$SSH_TRANSACTION" -eq 1 && -n "$SSH_BACKUP_DIR" ]]; then
+        warn "Restoring SSH configuration after a failed hardening step."
+        cp -a "$SSH_BACKUP_DIR/main" /etc/ssh/sshd_config
+        if [[ -f "$SSH_BACKUP_DIR/dropin" ]]; then
+            cp -a "$SSH_BACKUP_DIR/dropin" /etc/ssh/sshd_config.d/00-vpn-bootstrap.conf
+        else
+            rm -f /etc/ssh/sshd_config.d/00-vpn-bootstrap.conf
+        fi
+        systemctl reload ssh || true
+        SSH_TRANSACTION=0
+    fi
+    if [[ "$STATE_TRANSACTION" -eq 1 && -n "$STATE_BACKUP_DIR" ]]; then
+        warn "Restoring previous Xray state after a failed deployment."
+        if [[ -f "$STATE_BACKUP_DIR/state.json" ]]; then
+            cp -a "$STATE_BACKUP_DIR/state.json" "$STATE_FILE"
+        else
+            rm -f "$STATE_FILE"
+        fi
+        STATE_TRANSACTION=0
+    fi
+}
+cleanup_bootstrap() {
+    local rc=$?
+    trap - EXIT
+    rollback_pending
+    [[ -z "$STATE_BACKUP_DIR" ]] || rm -rf -- "$STATE_BACKUP_DIR"
+    [[ -z "$SSH_BACKUP_DIR" ]] || rm -rf -- "$SSH_BACKUP_DIR"
+    [[ -z "$IPV6_PROBE_FILE" ]] || rm -f -- "$IPV6_PROBE_FILE"
+    exit "$rc"
+}
+trap cleanup_bootstrap EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 trap '
     rc=$?
-    if (( BASH_SUBSHELL > 0 )); then
-        exit "$rc"
+    if (( BASH_SUBSHELL == 0 )); then
+        echo "ERROR: bootstrap failed at line $LINENO (exit $rc)." >&2
     fi
-    echo >&2
-    echo "ERROR: bootstrap failed at line $LINENO." >&2
-    echo "Command: $BASH_COMMAND" >&2
-    echo "Exit code: $rc" >&2
     exit "$rc"
 ' ERR
 
@@ -336,6 +373,10 @@ while [[ $# -gt 0 ]]; do
             CONFIGURE_FIREWALL=0
             shift
             ;;
+        --harden-ssh)
+            SSH_HARDENING=1
+            shift
+            ;;
         --no-ssh-hardening)
             SSH_HARDENING=0
             shift
@@ -362,6 +403,13 @@ done
 [[ -n "$VPN_USER" ]] || die "--user is required."
 is_valid_username "$VPN_USER" || die "Invalid VPN management username: $VPN_USER"
 [[ "$VPN_USER" != "root" ]] || die "The VPN management username cannot be root."
+if [[ "$SSH_HARDENING" -eq 1 && "${SUDO_USER:-}" != "$VPN_USER" ]]; then
+    die "First test a NEW SSH login as $VPN_USER, then rerun via sudo with --harden-ssh from that login."
+fi
+# Serialize the complete bootstrap before package/user/firewall changes.
+command -v flock >/dev/null || die "flock (util-linux) is required."
+exec 8>/run/lock/vpn-bootstrap.lock
+flock -n -x 8 || die "Another bootstrap is already running."
 
 if [[ -n "$SSH_PUBKEY" && -n "$SSH_PUBKEY_FILE" ]]; then
     die "Use either --pubkey or --pubkey-file, not both."
@@ -391,6 +439,7 @@ if [[ -n "$SSH_PUBKEY_FILE" ]]; then
     SSH_PUBKEY="$(awk 'NF { sub(/\r$/, ""); print }' "$SSH_PUBKEY_FILE")"
 fi
 
+[[ "$SSH_PUBKEY" != *$'\n'* && "$SSH_PUBKEY" != *$'\r'* ]] || die "Supply exactly one public key line."
 case "$SSH_PUBKEY" in
     ssh-*|ecdsa-*|sk-*) ;;
     *) die "The supplied value does not look like an OpenSSH public key." ;;
@@ -435,6 +484,7 @@ export NEEDRESTART_MODE=a
 export UCF_FORCE_CONFFOLD=1
 APT_OPTIONS=(
     -y
+    -o DPkg::Lock::Timeout=300
     -o Dpkg::Options::=--force-confdef
     -o Dpkg::Options::=--force-confold
 )
@@ -509,16 +559,18 @@ install -o root -g root -m 0440 "$SUDOERS_TMP" "$SUDOERS_FILE"
 rm -f "$SUDOERS_TMP"
 
 USER_HOME="$(getent passwd "$VPN_USER" | cut -d: -f6)"
-[[ -n "$USER_HOME" ]] || die "Could not determine home directory for $VPN_USER."
-install -d -o "$VPN_USER" -g "$VPN_USER" -m 0700 "$USER_HOME/.ssh"
+[[ -n "$USER_HOME" && "$USER_HOME" != "/" ]] || die "Invalid home directory for $VPN_USER."
+USER_GROUP="$(id -gn "$VPN_USER")"
+[[ ! -L "$USER_HOME/.ssh" && ! -L "$USER_HOME/.ssh/authorized_keys" ]] || die "SSH paths must not be symlinks."
+install -d -o "$VPN_USER" -g "$USER_GROUP" -m 0700 "$USER_HOME/.ssh"
 AUTHORIZED_KEYS="$USER_HOME/.ssh/authorized_keys"
 touch "$AUTHORIZED_KEYS"
-chown "$VPN_USER:$VPN_USER" "$AUTHORIZED_KEYS"
+chown "$VPN_USER:$USER_GROUP" "$AUTHORIZED_KEYS"
 chmod 0600 "$AUTHORIZED_KEYS"
 if ! grep -qxF "$SSH_PUBKEY" "$AUTHORIZED_KEYS"; then
     printf '%s\n' "$SSH_PUBKEY" >> "$AUTHORIZED_KEYS"
 fi
-chown "$VPN_USER:$VPN_USER" "$AUTHORIZED_KEYS"
+chown "$VPN_USER:$USER_GROUP" "$AUTHORIZED_KEYS"
 chmod 0600 "$AUTHORIZED_KEYS"
 
 echo "VPN management user ready: $VPN_USER"
@@ -656,6 +708,9 @@ systemctl is-active --quiet docker || die "Docker service is not running."
 docker info >/dev/null
 
 echo "Docker: $(docker --version)"
+if ! docker compose version >/dev/null 2>&1; then
+    die "Docker works, but Compose v2 is missing. Install its plugin before rerunning."
+fi
 echo "Compose: $(docker compose version)"
 
 # Keep Docker logs bounded and keep containers alive across daemon upgrades when possible.
@@ -671,9 +726,25 @@ else
 fi
 
 if [[ ! -f "$DOCKER_DAEMON_JSON" ]] || ! cmp -s "$DOCKER_DAEMON_TMP" "$DOCKER_DAEMON_JSON"; then
+    dockerd --validate --config-file "$DOCKER_DAEMON_TMP" >/dev/null
+    DOCKER_CONFIG_BACKUP="$(mktemp)"
+    DOCKER_CONFIG_EXISTED=0
+    if [[ -f "$DOCKER_DAEMON_JSON" ]]; then
+        cp -a "$DOCKER_DAEMON_JSON" "$DOCKER_CONFIG_BACKUP"
+        DOCKER_CONFIG_EXISTED=1
+    fi
     install -o root -g root -m 0644 "$DOCKER_DAEMON_TMP" "$DOCKER_DAEMON_JSON"
-    systemctl restart docker
-    systemctl is-active --quiet docker || die "Docker failed after daemon configuration update."
+    if ! systemctl restart docker || ! systemctl is-active --quiet docker; then
+        if [[ "$DOCKER_CONFIG_EXISTED" -eq 1 ]]; then
+            cp -a "$DOCKER_CONFIG_BACKUP" "$DOCKER_DAEMON_JSON"
+        else
+            rm -f "$DOCKER_DAEMON_JSON"
+        fi
+        systemctl restart docker || warn "Docker recovery failed; inspect journalctl -u docker."
+        rm -f "$DOCKER_CONFIG_BACKUP" "$DOCKER_DAEMON_TMP"
+        die "Docker rejected the new daemon settings; previous configuration restored."
+    fi
+    rm -f "$DOCKER_CONFIG_BACKUP"
 fi
 rm -f "$DOCKER_DAEMON_TMP"
 
@@ -681,8 +752,24 @@ rm -f "$DOCKER_DAEMON_TMP"
 # Harden SSH
 # ------------------------------------------------------------------------------
 
-SSH_PORT="$(sshd -T | awk '$1 == "port" && !found {print $2; found=1}')"
-[[ -n "$SSH_PORT" ]] || die "Could not determine SSH port."
+# Union of configured ports, actual sshd listeners, socket-activation ports,
+# and the server port of the current SSH connection (when preserved by sudo).
+SSH_CONFIGURATION="$(sshd -T)"
+mapfile -t SSH_PORTS <<< "$(
+    {
+        printf '%s\n' "$SSH_CONFIGURATION" | awk '$1 == "port" {print $2}'
+        ss -H -ltnp | awk '/"sshd"/ {n=split($4,a,":"); print a[n]}'
+        systemctl show ssh.socket -p Listen --value 2>/dev/null |
+            tr ' ' '\n' | sed -nE 's/.*:([0-9]+)$/\1/p' || true
+        if [[ -n "${SSH_CONNECTION:-}" ]]; then
+            read -r _ _ _ current_ssh_port <<< "$SSH_CONNECTION"
+            printf '%s\n' "$current_ssh_port"
+        fi
+    } | awk '/^[0-9]+$/ && $1 > 0 && $1 <= 65535 {print $1}' | sort -nu
+)"
+(( ${#SSH_PORTS[@]} > 0 )) && is_valid_port "${SSH_PORTS[0]}" || die "Could not determine any SSH ports."
+SSH_PORT="${SSH_PORTS[0]}"
+printf 'Preserving SSH ports: %s\n' "${SSH_PORTS[*]}"
 
 if [[ "$SSH_HARDENING" -eq 1 ]]; then
     log "SSH HARDENING"
@@ -690,6 +777,10 @@ if [[ "$SSH_HARDENING" -eq 1 ]]; then
     SSH_DROPIN_DIR="/etc/ssh/sshd_config.d"
     SSH_DROPIN="$SSH_DROPIN_DIR/00-vpn-bootstrap.conf"
     mkdir -p "$SSH_DROPIN_DIR"
+    SSH_BACKUP_DIR="$(mktemp -d /etc/ssh/.vpn-hardening.XXXXXX)"
+    cp -a "$SSH_MAIN" "$SSH_BACKUP_DIR/main"
+    [[ ! -f "$SSH_DROPIN" ]] || cp -a "$SSH_DROPIN" "$SSH_BACKUP_DIR/dropin"
+    SSH_TRANSACTION=1
 
     cat > "$SSH_DROPIN" <<'EOF'
 PermitRootLogin no
@@ -717,7 +808,11 @@ EOF
     fi
 
     sshd -t
-    SSH_EFFECTIVE="$(sshd -T | grep -E '^(permitrootlogin|pubkeyauthentication|passwordauthentication|kbdinteractiveauthentication|permitemptypasswords|maxauthtries|x11forwarding) ')"
+    SSH_CLIENT_ADDR="${SSH_CONNECTION:-}"
+    SSH_CLIENT_ADDR="${SSH_CLIENT_ADDR%% *}"
+    SSH_CLIENT_ADDR="${SSH_CLIENT_ADDR:-127.0.0.1}"
+    # Evaluate Match rules for the management user, too.
+    SSH_EFFECTIVE="$(sshd -T -C "user=$VPN_USER,host=localhost,addr=${SSH_CLIENT_ADDR:-127.0.0.1}" 2>/dev/null | grep -E '^(permitrootlogin|pubkeyauthentication|passwordauthentication|kbdinteractiveauthentication|permitemptypasswords|maxauthtries|x11forwarding) ')"
 
     for expected in \
         'permitrootlogin no' \
@@ -736,9 +831,12 @@ EOF
 
     systemctl reload ssh
     systemctl is-active --quiet ssh || die "SSH service is not running after reload."
+    SSH_TRANSACTION=0
     echo "$SSH_EFFECTIVE"
 else
-    log "SSH HARDENING SKIPPED"
+    log "SSH AUTHENTICATION LEFT UNCHANGED"
+    echo "Test a new key-based SSH login as $VPN_USER; then rerun via sudo with --harden-ssh."
+    echo "Root/password login settings have not been hardened by this run."
 fi
 
 # ------------------------------------------------------------------------------
@@ -751,15 +849,17 @@ SERVER_IPV4="$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if
 
 IPV6_EGRESS_OK=0
 SERVER_IPV6=""
-if curl -6 -fsS --max-time 6 https://api64.ipify.org >/tmp/vpn-bootstrap-ipv6 2>/dev/null; then
-    SERVER_IPV6="$(tr -d '\r\n' </tmp/vpn-bootstrap-ipv6)"
+IPV6_PROBE_FILE="$(mktemp)"
+if curl -6 -fsS --max-time 6 https://api64.ipify.org >"$IPV6_PROBE_FILE" 2>/dev/null; then
+    SERVER_IPV6="$(tr -d '\r\n' <"$IPV6_PROBE_FILE")"
     if [[ "$SERVER_IPV6" == *:* ]]; then
         IPV6_EGRESS_OK=1
     else
         SERVER_IPV6=""
     fi
 fi
-rm -f /tmp/vpn-bootstrap-ipv6
+rm -f "$IPV6_PROBE_FILE"
+IPV6_PROBE_FILE=""
 
 if [[ "$IPV6_EGRESS_OK" -eq 1 ]]; then
     echo "IPv4: $SERVER_IPV4"
@@ -777,6 +877,13 @@ log "XRAY STATE"
 install -d -o root -g root -m 0700 "$VPN_ROOT" "$XRAY_DIR"
 touch "$LOCK_FILE"
 chmod 0600 "$LOCK_FILE"
+exec 9>"$LOCK_FILE"
+flock -x 9
+# Children inherit this descriptor; renderer must not acquire the same lock again.
+export VPN_LOCK_HELD=1
+STATE_BACKUP_DIR="$(mktemp -d "$VPN_ROOT/.state-backup.XXXXXX")"
+[[ ! -f "$STATE_FILE" ]] || cp -a "$STATE_FILE" "$STATE_BACKUP_DIR/state.json"
+STATE_TRANSACTION=1
 
 if [[ ! -f "$USERS_FILE" ]]; then
     printf '{"users":[]}\n' > "$USERS_FILE"
@@ -849,17 +956,19 @@ else
 fi
 
 is_valid_port "$XRAY_PORT" || die "Invalid Xray port: $XRAY_PORT"
+for port in "${SSH_PORTS[@]}"; do
+    [[ "$XRAY_PORT" != "$port" ]] || die "Xray port conflicts with SSH TCP/$port."
+done
 is_valid_hostname_or_ip "$ENDPOINT_HOST" || die "Invalid endpoint host: $ENDPOINT_HOST"
 is_valid_hostname_or_ip "$REALITY_TARGET" || die "Invalid REALITY target: $REALITY_TARGET"
 [[ "$REALITY_TARGET" != *:* ]] || die "REALITY target must be a hostname without a port."
 [[ "$BLOCK_RU" == "true" || "$BLOCK_RU" == "false" ]] || die "Invalid block_ru state."
 
 STATE_TMP="$(mktemp)"
-jq -n \
+jq -Rn \
     --arg image "$XRAY_IMAGE" \
     --argjson port "$XRAY_PORT" \
     --arg target "$REALITY_TARGET" \
-    --arg private_key "$REALITY_PRIVATE_KEY" \
     --arg public_key "$REALITY_PUBLIC_KEY" \
     --arg endpoint_mode "$ENDPOINT_MODE" \
     --arg endpoint_host "$ENDPOINT_HOST" \
@@ -867,7 +976,7 @@ jq -n \
     --arg server_ipv4 "$SERVER_IPV4" \
     --arg server_ipv6 "$SERVER_IPV6" \
     --argjson ipv6_ok "$(json_bool "$IPV6_EGRESS_OK")" \
-    '{
+    'input as $private_key | {
         xray_image:$image,
         xray_port:$port,
         reality_target:$target,
@@ -879,7 +988,7 @@ jq -n \
         server_ipv4:$server_ipv4,
         server_ipv6:$server_ipv6,
         ipv6_egress_ok:$ipv6_ok
-    }' > "$STATE_TMP"
+    }' > "$STATE_TMP" <<< "$REALITY_PRIVATE_KEY"
 install -o root -g root -m 0600 "$STATE_TMP" "$STATE_FILE"
 rm -f "$STATE_TMP"
 
@@ -925,13 +1034,16 @@ XRAY_CONTAINER="xray-reality"
 XRAY_CONTAINER_PORT=8443
 
 [[ $EUID -eq 0 ]] || { echo "ERROR: run as root" >&2; exit 1; }
+if [[ "${VPN_LOCK_HELD:-0}" != 1 ]]; then
+    exec 9>"$VPN_ROOT/.lock"
+    flock -x 9
+fi
 jq empty "$STATE_FILE"
 jq -e '.users | type == "array"' "$USERS_FILE" >/dev/null
 
 XRAY_IMAGE="$(jq -r '.xray_image' "$STATE_FILE")"
 XRAY_PORT="$(jq -r '.xray_port' "$STATE_FILE")"
 REALITY_TARGET="$(jq -r '.reality_target' "$STATE_FILE")"
-REALITY_PRIVATE_KEY="$(jq -r '.reality_private_key' "$STATE_FILE")"
 BLOCK_RU="$(jq -r '.block_ru' "$STATE_FILE")"
 IPV6_OK="$(jq -r '.ipv6_egress_ok' "$STATE_FILE")"
 
@@ -961,13 +1073,48 @@ fi
 # mode 0700 on the host, so unprivileged host users still cannot access it.
 CONFIG_TMP="$(mktemp "$XRAY_DIR/.config.json.tmp.XXXXXX")"
 VALIDATION_LOG="$(mktemp)"
-trap 'rm -f "$CONFIG_TMP" "$VALIDATION_LOG"' EXIT
+COMPOSE_TMP="$(mktemp "$VPN_ROOT/.compose.tmp.XXXXXX")"
+DEPLOY_BACKUP="$(mktemp -d "$VPN_ROOT/.deploy-backup.XXXXXX")"
+DEPLOY_PENDING=0
+HAD_COMPOSE=0
+HAD_CONFIG=0
+[[ ! -f "$COMPOSE_FILE" ]] || { cp -a "$COMPOSE_FILE" "$DEPLOY_BACKUP/compose.yml"; HAD_COMPOSE=1; }
+[[ ! -f "$XRAY_DIR/config.json" ]] || { cp -a "$XRAY_DIR/config.json" "$DEPLOY_BACKUP/config.json"; HAD_CONFIG=1; }
+cleanup_deployment() {
+    local rc=$?
+    trap - EXIT
+    if [[ "$DEPLOY_PENDING" -eq 1 ]]; then
+        echo "ERROR: applying Xray failed; restoring previous deployment." >&2
+        if [[ "$HAD_CONFIG" -eq 1 ]]; then
+            cp -a "$DEPLOY_BACKUP/config.json" "$XRAY_DIR/config.json"
+        else
+            rm -f "$XRAY_DIR/config.json"
+        fi
+        if [[ "$HAD_COMPOSE" -eq 1 ]]; then
+            cp -a "$DEPLOY_BACKUP/compose.yml" "$COMPOSE_FILE"
+            # Recreate: a single-file bind mount may still reference the replaced inode.
+            if ! docker compose --project-directory "$VPN_ROOT" -f "$COMPOSE_FILE" up -d --force-recreate --remove-orphans >&2; then
+                echo "ERROR: automatic deployment recovery failed; check Docker logs." >&2
+            fi
+        else
+            # Only remove the deployment if Compose actually created it for us.
+            docker compose --project-directory "$VPN_ROOT" -f "$COMPOSE_FILE" down --remove-orphans >&2 || true
+            rm -f "$COMPOSE_FILE"
+        fi
+    fi
+    rm -f "$CONFIG_TMP" "$VALIDATION_LOG" "$COMPOSE_TMP"
+    rm -rf -- "$DEPLOY_BACKUP"
+    exit "$rc"
+}
+trap cleanup_deployment EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 jq -n \
     --arg listen "$LISTEN_ADDR" \
     --argjson port "$XRAY_CONTAINER_PORT" \
     --arg target "$REALITY_TARGET" \
-    --arg private_key "$REALITY_PRIVATE_KEY" \
+    --slurpfile state "$STATE_FILE" \
     --arg freedom_strategy "$FREEDOM_STRATEGY" \
     --argjson block_ru "$BLOCK_RU" \
     --slurpfile db "$USERS_FILE" '
@@ -994,7 +1141,7 @@ jq -n \
               target:($target + ":443"),
               xver:0,
               serverNames:[$target],
-              privateKey:$private_key,
+              privateKey:$state[0].reality_private_key,
               shortIds:$short_ids
             }
           },
@@ -1063,13 +1210,11 @@ else
     exit "$rc"
 fi
 
-install -o root -g root -m 0644 "$CONFIG_TMP" "$XRAY_DIR/config.json"
-
 # Use the normal Docker bridge model. The official Xray image remains non-root
 # and listens on an unprivileged container port. Docker publishes the requested
 # host port (443 by default) to that internal port. No root user override and no
 # NET_BIND_SERVICE capability are required.
-cat > "$COMPOSE_FILE" <<EOF
+cat > "$COMPOSE_TMP" <<EOF
 services:
   xray:
     image: ${XRAY_IMAGE}
@@ -1096,17 +1241,25 @@ networks:
     driver: bridge
 ${NETWORK_IPV6_LINE}
 EOF
-chmod 0600 "$COMPOSE_FILE"
+chmod 0600 "$COMPOSE_TMP"
 
 cd "$VPN_ROOT"
-# Validate Compose syntax before changing the running deployment.
-docker compose -f "$COMPOSE_FILE" config -q
-docker compose -f "$COMPOSE_FILE" up -d --remove-orphans
+# Relative volume paths are resolved against VPN_ROOT even for the candidate file.
+docker compose --project-directory "$VPN_ROOT" -f "$COMPOSE_TMP" config -q
+DEPLOY_PENDING=1
+install -o root -g root -m 0644 "$CONFIG_TMP" "$XRAY_DIR/config.json"
+install -o root -g root -m 0600 "$COMPOSE_TMP" "$COMPOSE_FILE"
+docker compose --project-directory "$VPN_ROOT" -f "$COMPOSE_FILE" up -d --force-recreate --remove-orphans
 
 for _ in $(seq 1 20); do
     if [[ "$(docker inspect -f '{{.State.Running}}' "$XRAY_CONTAINER" 2>/dev/null || true)" == "true" ]] && \
        nc -4 -z -w 1 127.0.0.1 "$XRAY_PORT" >/dev/null 2>&1; then
-        exit 0
+        # Catch immediate crash/restart loops instead of trusting the first TCP accept.
+        sleep 2
+        if [[ "$(docker inspect -f '{{.State.Running}} {{.RestartCount}}' "$XRAY_CONTAINER" 2>/dev/null || true)" == "true 0" ]]; then
+            DEPLOY_PENDING=0
+            exit 0
+        fi
     fi
     sleep 1
 done
@@ -1187,6 +1340,7 @@ add_user() {
     validate_name "$name"
     exec 9>"$LOCK_FILE"
     flock -x 9
+    export VPN_LOCK_HELD=1
     load_state
 
     if jq -e --arg n "$name" '.users[]? | select(.name==$n)' "$USERS_FILE" >/dev/null; then
@@ -1203,14 +1357,13 @@ add_user() {
     backup="${USERS_FILE}.bak"
     cp -a "$USERS_FILE" "$backup"
 
-    jq --arg n "$name" --arg u "$uuid" --arg s "$sid" \
-        '.users += [{name:$n,uuid:$u,sid:$s}]' "$USERS_FILE" > "$tmp"
+    jq -Rn --arg n "$name" --arg s "$sid" --slurpfile db "$USERS_FILE" \
+        'input as $u | $db[0] | .users += [{name:$n,uuid:$u,sid:$s}]' > "$tmp" <<< "$uuid"
     install -o root -g root -m 0600 "$tmp" "$USERS_FILE"
     rm -f "$tmp"
 
     if ! /usr/local/libexec/vpn-render-xray; then
         cp -a "$backup" "$USERS_FILE"
-        /usr/local/libexec/vpn-render-xray || true
         echo "ERROR: user creation rolled back" >&2
         exit 1
     fi
@@ -1232,6 +1385,7 @@ remove_user() {
     validate_name "$name"
     exec 9>"$LOCK_FILE"
     flock -x 9
+    export VPN_LOCK_HELD=1
 
     if ! jq -e --arg n "$name" '.users[]? | select(.name==$n)' "$USERS_FILE" >/dev/null; then
         echo "User does not exist: $name"
@@ -1248,7 +1402,6 @@ remove_user() {
 
     if ! /usr/local/libexec/vpn-render-xray; then
         cp -a "$backup" "$USERS_FILE"
-        /usr/local/libexec/vpn-render-xray || true
         echo "ERROR: user removal rolled back" >&2
         exit 1
     fi
@@ -1281,6 +1434,11 @@ status() {
 
 COMMAND="${1:-}"
 shift || true
+# Serialize readers too: they must not observe a half-applied users database.
+if [[ "${VPN_LOCK_HELD:-0}" != 1 && ( "$COMMAND" == show-user || "$COMMAND" == list-users || "$COMMAND" == status ) ]]; then
+    exec 9>"$LOCK_FILE"
+    flock -s 9
+fi
 
 case "$COMMAND" in
     add-user)
@@ -1340,7 +1498,8 @@ chmod 0700 /usr/local/sbin/vpn-add-user /usr/local/sbin/vpn-remove-user \
 
 log "XRAY PORT CHECK"
 if ss -H -ltn "sport = :${XRAY_PORT}" | awk 'NF {found=1} END {exit !found}'; then
-    if docker ps --format '{{.Names}}' | grep -Fx "$XRAY_CONTAINER" >/dev/null; then
+    if docker inspect "$XRAY_CONTAINER" 2>/dev/null |
+        jq -e --arg p "$XRAY_PORT" '.[0].NetworkSettings.Ports // {} | [.[]? // [] | .[]? | .HostPort] | index($p) != null' >/dev/null; then
         echo "TCP/$XRAY_PORT is already owned by the existing Xray deployment."
     else
         echo "TCP/$XRAY_PORT is already occupied:"
@@ -1357,6 +1516,7 @@ fi
 
 log "XRAY DEPLOYMENT"
 /usr/local/libexec/vpn-render-xray
+STATE_TRANSACTION=0
 
 [[ "$(docker inspect -f '{{.State.Running}}' "$XRAY_CONTAINER" 2>/dev/null || true)" == "true" ]] || \
     die "Xray container is not running."
@@ -1385,7 +1545,9 @@ if [[ "$CONFIGURE_FIREWALL" -eq 1 ]]; then
     sed -i 's/^IPV6=.*/IPV6=yes/' /etc/default/ufw
     ufw default deny incoming >/dev/null
     ufw default allow outgoing >/dev/null
-    ufw allow "${SSH_PORT}/tcp" comment 'SSH' >/dev/null
+    for port in "${SSH_PORTS[@]}"; do
+        ufw allow "${port}/tcp" comment 'SSH' >/dev/null
+    done
     ufw allow "${XRAY_PORT}/tcp" comment 'Xray REALITY' >/dev/null
     ufw --force enable >/dev/null
     ufw status verbose
@@ -1411,7 +1573,7 @@ echo "============================================================"
 echo "VPN BOOTSTRAP COMPLETE"
 echo "============================================================"
 echo "VPN management user : $VPN_USER"
-echo "SSH port            : $SSH_PORT"
+echo "SSH ports           : ${SSH_PORTS[*]}"
 echo "Client endpoint      : $ENDPOINT_HOST:$XRAY_PORT"
 echo "Protocol             : VLESS + XTLS Vision + REALITY"
 echo "REALITY target       : $REALITY_TARGET"
@@ -1435,6 +1597,9 @@ echo "    sudo vpn-list-users"
 echo "    sudo vpn-status"
 echo
 echo "IMPORTANT:"
-echo "Before closing your current SSH session, verify a new SSH login as $VPN_USER."
+echo "Before closing this SSH session, verify a NEW key-based SSH login as $VPN_USER."
+if [[ "$SSH_HARDENING" -eq 0 ]]; then
+    echo "SSH hardening is pending: from that login rerun this script via sudo with --harden-ssh."
+fi
 echo "Treat every vless:// link and QR code as a credential."
 echo "============================================================"
