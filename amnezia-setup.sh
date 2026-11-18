@@ -1,4 +1,3 @@
-```bash
 #!/usr/bin/env bash
 set -Eeuo pipefail
 
@@ -232,4 +231,3 @@ echo "Setup completed."
 echo
 echo "Connect using:"
 echo "ssh -p $SSH_PORT -i \"${PUBKEY_FILE%.pub}\" $TARGET_USER@$SERVER_IP"
-```
