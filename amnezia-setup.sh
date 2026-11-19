@@ -3,13 +3,6 @@ set -Eeuo pipefail
 
 # Usage:
 # ./amnezia-setup.sh SERVER_IP ADMIN_USER PUBLIC_KEY [SSH_PORT] [NEW_USER] [NEW_PASSWORD]
-#
-# Defaults:
-# SSH_PORT=22
-# NEW_USER=amnezia
-# NEW_PASSWORD=amnezia
-#
-# Use "-" as NEW_PASSWORD to enter it interactively.
 
 if [[ $# -lt 3 || $# -gt 6 ]]; then
     echo "Usage: $0 SERVER_IP ADMIN_USER PUBLIC_KEY [SSH_PORT] [NEW_USER] [NEW_PASSWORD]"
@@ -23,21 +16,12 @@ SSH_PORT="${4:-22}"
 TARGET_USER="${5:-amnezia}"
 TARGET_PASSWORD="${6:-amnezia}"
 
-# --------------------------------------------------
-# Validation
-# --------------------------------------------------
-
 for cmd in ssh ssh-keygen base64 awk; do
     command -v "$cmd" >/dev/null 2>&1 || {
         echo "ERROR: Required command not found: $cmd"
         exit 1
     }
 done
-
-if [[ "$SERVER_HOST" == -* ]]; then
-    echo "ERROR: Invalid server address."
-    exit 1
-fi
 
 if [[ ! "$ADMIN_USER" =~ ^[a-zA-Z0-9._-]+$ ]]; then
     echo "ERROR: Invalid administrator username."
@@ -52,12 +36,12 @@ fi
 SSH_PORT=$((10#$SSH_PORT))
 
 if (( SSH_PORT < 1 || SSH_PORT > 65535 )); then
-    echo "ERROR: SSH port must be between 1 and 65535."
+    echo "ERROR: Invalid SSH port."
     exit 1
 fi
 
 if [[ ! "$TARGET_USER" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]]; then
-    echo "ERROR: Invalid Linux username: $TARGET_USER"
+    echo "ERROR: Invalid Linux username."
     exit 1
 fi
 
@@ -71,16 +55,16 @@ if [[ -z "$TARGET_PASSWORD" ||
       "$TARGET_PASSWORD" == *:* ||
       "$TARGET_PASSWORD" == *$'\n'* ||
       "$TARGET_PASSWORD" == *$'\r'* ]]; then
-    echo "ERROR: Invalid password. Empty passwords, colons and newlines are not supported."
+    echo "ERROR: Invalid password."
     exit 1
 fi
 
 if [[ ! -f "$PUBKEY_FILE" ]]; then
-    echo "ERROR: Public key file not found: $PUBKEY_FILE"
+    echo "ERROR: Public key file not found."
     exit 1
 fi
 
-if ! PUBKEY_LINE=$(awk '
+PUBKEY_LINE=$(awk '
     NF {
         count++
         key=$0
@@ -89,19 +73,15 @@ if ! PUBKEY_LINE=$(awk '
         if (count != 1) exit 1
         print key
     }
-' "$PUBKEY_FILE"); then
+' "$PUBKEY_FILE") || {
     echo "ERROR: Public key file must contain exactly one key."
     exit 1
-fi
+}
 
 if ! ssh-keygen -lf "$PUBKEY_FILE" >/dev/null 2>&1; then
     echo "ERROR: Invalid public SSH key."
     exit 1
 fi
-
-# --------------------------------------------------
-# Encode values for secure transport via SSH stdin
-# --------------------------------------------------
 
 encode() {
     printf '%s' "$1" | base64 | tr -d '\r\n'
@@ -113,8 +93,6 @@ PUBKEY_B64=$(encode "$PUBKEY_LINE")
 
 SUDO_PASSWORD_B64=""
 
-# For non-root administrators, sudo may require a
-# separate password. Press Enter if sudo is passwordless.
 if [[ "$ADMIN_USER" != "root" ]]; then
     printf "Sudo password for %s (Enter if passwordless sudo): " \
         "$ADMIN_USER" >&2
@@ -131,13 +109,6 @@ unset TARGET_PASSWORD
 # --------------------------------------------------
 # Remote privilege escalation
 # --------------------------------------------------
-
-# The first line of stdin is reserved for the sudo
-# password for non-root users. The remaining stdin
-# contains the actual installation script.
-#
-# No remote PTY is allocated. SSH password prompts
-# are handled locally by the SSH client.
 
 REMOTE_COMMAND='
 set -eu
@@ -165,27 +136,26 @@ unset SUDO_PASSWORD SUDO_PASSWORD_B64
 exec sudo -n bash -s
 '
 
-# --------------------------------------------------
-# Remote installation script
-# --------------------------------------------------
-
 echo "===================================="
 echo "Server:      $SERVER_HOST"
 echo "Admin:       $ADMIN_USER"
 echo "New user:    $TARGET_USER"
 echo "SSH port:    $SSH_PORT"
 echo "===================================="
+
+if [[ "$TARGET_PASSWORD_B64" == "$(encode amnezia)" ]]; then
+    echo "WARNING: Using default password."
+fi
+
 echo
 echo "Connecting using PASSWORD authentication only..."
 echo
 
 {
-    # Non-root user: first line is reserved for sudo.
     if [[ "$ADMIN_USER" != "root" ]]; then
         printf '%s\n' "$SUDO_PASSWORD_B64"
     fi
 
-    # Send parameters as base64 assignments.
     printf 'TARGET_USER_B64=%s\n' "$TARGET_USER_B64"
     printf 'TARGET_PASSWORD_B64=%s\n' "$TARGET_PASSWORD_B64"
     printf 'PUBKEY_B64=%s\n' "$PUBKEY_B64"
@@ -195,16 +165,13 @@ echo
 
 set -Eeuo pipefail
 
-# Decode parameters
 TARGET_USER=$(printf '%s' "$TARGET_USER_B64" | base64 -d)
 TARGET_PASSWORD=$(printf '%s' "$TARGET_PASSWORD_B64" | base64 -d)
 PUBKEY=$(printf '%s' "$PUBKEY_B64" | base64 -d)
 
 SSH_CONFIG="/etc/ssh/sshd_config"
-
-# --------------------------------------------------
-# Check environment
-# --------------------------------------------------
+SUDOERS_DIR="/etc/sudoers.d"
+SUDOERS_FILE="$SUDOERS_DIR/90-${TARGET_USER}-nopasswd"
 
 if [[ "$(id -u)" -ne 0 ]]; then
     echo "ERROR: Root privileges required."
@@ -212,21 +179,20 @@ if [[ "$(id -u)" -ne 0 ]]; then
 fi
 
 for cmd in useradd usermod chpasswd getent sshd \
-           ssh-keygen systemctl base64; do
+           ssh-keygen systemctl base64 visudo runuser; do
     command -v "$cmd" >/dev/null 2>&1 || {
         echo "ERROR: Required server command not found: $cmd"
         exit 1
     }
 done
 
-if [[ ! -f "$SSH_CONFIG" ]]; then
-    echo "ERROR: SSH configuration not found: $SSH_CONFIG"
+if [[ ! -f "$SSH_CONFIG" || ! -d "$SUDOERS_DIR" ]]; then
+    echo "ERROR: SSH or sudo configuration not found."
     exit 1
 fi
 
 if ! getent group sudo >/dev/null 2>&1; then
-    echo "ERROR: Group 'sudo' does not exist."
-    echo "This script expects Ubuntu/Debian."
+    echo "ERROR: Group sudo not found. Ubuntu/Debian expected."
     exit 1
 fi
 
@@ -242,15 +208,65 @@ else
     echo "Created user: $TARGET_USER"
 fi
 
-# Set password
 printf '%s:%s\n' "$TARGET_USER" "$TARGET_PASSWORD" | chpasswd
-
 unset TARGET_PASSWORD
 
-# Add user to sudo group
 usermod -aG sudo "$TARGET_USER"
 
-echo "Sudo privileges configured."
+echo "Sudo group configured."
+
+# --------------------------------------------------
+# Configure passwordless sudo
+# --------------------------------------------------
+
+SUDOERS_BACKUP=""
+
+if [[ -e "$SUDOERS_FILE" ]]; then
+    SUDOERS_BACKUP="${SUDOERS_FILE}.backup-$(date +%Y%m%d-%H%M%S)-$$"
+    cp -a "$SUDOERS_FILE" "$SUDOERS_BACKUP"
+fi
+
+SUDOERS_TMP=$(mktemp "$SUDOERS_DIR/.${TARGET_USER}.XXXXXX")
+
+printf '%s ALL=(ALL:ALL) NOPASSWD: ALL\n' "$TARGET_USER" \
+    > "$SUDOERS_TMP"
+
+chmod 0440 "$SUDOERS_TMP"
+
+if ! visudo -cf "$SUDOERS_TMP"; then
+    rm -f "$SUDOERS_TMP"
+    echo "ERROR: Invalid sudoers configuration."
+    exit 1
+fi
+
+mv -f "$SUDOERS_TMP" "$SUDOERS_FILE"
+
+if ! visudo -c; then
+    echo "ERROR: Full sudoers validation failed."
+
+    if [[ -n "$SUDOERS_BACKUP" ]]; then
+        cp -a "$SUDOERS_BACKUP" "$SUDOERS_FILE"
+    else
+        rm -f "$SUDOERS_FILE"
+    fi
+
+    exit 1
+fi
+
+# Test that passwordless sudo actually works
+if ! runuser -u "$TARGET_USER" -- sudo -n true; then
+    echo "ERROR: Passwordless sudo test failed."
+
+    if [[ -n "$SUDOERS_BACKUP" ]]; then
+        cp -a "$SUDOERS_BACKUP" "$SUDOERS_FILE"
+    else
+        rm -f "$SUDOERS_FILE"
+    fi
+
+    exit 1
+fi
+
+echo "Passwordless sudo configured and tested."
 
 # --------------------------------------------------
 # Configure SSH public key
@@ -279,9 +295,7 @@ if ! grep -qxF -- "$PUBKEY" "$USER_HOME/.ssh/authorized_keys"; then
     printf '%s\n' "$PUBKEY" >> "$USER_HOME/.ssh/authorized_keys"
 fi
 
-chown "$TARGET_USER:$USER_GROUP" \
-    "$USER_HOME/.ssh/authorized_keys"
-
+chown "$TARGET_USER:$USER_GROUP" "$USER_HOME/.ssh/authorized_keys"
 chmod 600 "$USER_HOME/.ssh/authorized_keys"
 
 echo "SSH public key installed."
@@ -294,10 +308,10 @@ BACKUP="${SSH_CONFIG}.backup-amnezia-$(date +%Y%m%d-%H%M%S)-$$"
 
 cp -a "$SSH_CONFIG" "$BACKUP"
 
-echo "SSH configuration backup: $BACKUP"
+echo "SSH backup: $BACKUP"
 
 # --------------------------------------------------
-# Remove previous managed configuration block
+# Remove previous managed block
 # --------------------------------------------------
 
 BEGIN_MARKER="# BEGIN AMNEZIA-SSH-KEY-ONLY"
@@ -305,7 +319,7 @@ END_MARKER="# END AMNEZIA-SSH-KEY-ONLY"
 
 if grep -qF "$BEGIN_MARKER" "$SSH_CONFIG"; then
     if ! grep -qF "$END_MARKER" "$SSH_CONFIG"; then
-        echo "ERROR: Previous managed SSH block is incomplete."
+        echo "ERROR: Previous SSH block is incomplete."
         exit 1
     fi
 
@@ -315,7 +329,7 @@ if grep -qF "$BEGIN_MARKER" "$SSH_CONFIG"; then
 fi
 
 # --------------------------------------------------
-# Restrict SSH for the requested user
+# Restrict SSH for this user only
 # --------------------------------------------------
 
 cat >> "$SSH_CONFIG" <<SSH_BLOCK
@@ -329,16 +343,10 @@ Match User $TARGET_USER
 $END_MARKER
 SSH_BLOCK
 
-# --------------------------------------------------
-# Validate SSH configuration
-# --------------------------------------------------
-
 SSHD_BIN=$(command -v sshd)
 
 if ! "$SSHD_BIN" -t -f "$SSH_CONFIG"; then
-    echo "ERROR: Invalid SSH configuration."
-    echo "Restoring backup..."
-
+    echo "ERROR: Invalid SSH configuration. Restoring backup."
     cp -a "$BACKUP" "$SSH_CONFIG"
     exit 1
 fi
@@ -356,10 +364,8 @@ EXPECTED_SETTINGS=(
 
 for setting in "${EXPECTED_SETTINGS[@]}"; do
     if ! grep -Fxq "$setting" <<< "$EFFECTIVE"; then
-        echo "ERROR: Effective SSH setting not applied:"
-        echo "  $setting"
-        echo "Restoring backup..."
-
+        echo "ERROR: SSH setting not applied: $setting"
+        echo "Restoring backup."
         cp -a "$BACKUP" "$SSH_CONFIG"
         exit 1
     fi
@@ -368,34 +374,22 @@ done
 echo "SSH configuration validated."
 
 # --------------------------------------------------
-# Reload SSH without dropping existing connections
+# Reload SSH
 # --------------------------------------------------
 
-reload_ssh() {
-    if systemctl reload ssh.service 2>/dev/null; then
-        return 0
-    fi
-
-    if systemctl reload sshd.service 2>/dev/null; then
-        return 0
-    fi
-
-    return 1
-}
-
-if ! reload_ssh; then
-    echo "ERROR: Failed to reload SSH."
-    echo "Restoring previous configuration..."
-
+if systemctl reload ssh.service 2>/dev/null ||
+   systemctl reload sshd.service 2>/dev/null; then
+    :
+else
+    echo "ERROR: SSH reload failed. Restoring backup."
     cp -a "$BACKUP" "$SSH_CONFIG"
-    reload_ssh || true
+
+    systemctl reload ssh.service 2>/dev/null ||
+        systemctl reload sshd.service 2>/dev/null ||
+        true
 
     exit 1
 fi
-
-# --------------------------------------------------
-# Success
-# --------------------------------------------------
 
 echo
 echo "======================================"
@@ -403,11 +397,13 @@ echo "SUCCESS!"
 echo "======================================"
 echo "User:                  $TARGET_USER"
 echo "Sudo:                  enabled"
+echo "Sudo password:         NOT REQUIRED"
 echo "SSH public key:        installed"
 echo "SSH password login:   disabled"
 echo "SSH key login:         enabled"
 echo "Other users:           unchanged"
-echo "Backup:                $BACKUP"
+echo "SSH backup:            $BACKUP"
+echo "Sudoers file:          $SUDOERS_FILE"
 echo "======================================"
 
 REMOTE_SCRIPT
@@ -427,5 +423,5 @@ REMOTE_SCRIPT
 echo
 echo "Setup completed."
 echo
-echo "Connect to the new user using:"
+echo "Connect using:"
 echo "ssh -p $SSH_PORT -i PRIVATE_KEY $TARGET_USER@$SERVER_HOST"
