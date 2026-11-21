@@ -42,6 +42,11 @@ done
 printf '\nDocker availability:\n'
 if command -v docker >/dev/null; then
     docker --version
+    if docker compose version >/dev/null 2>&1; then
+        docker compose version
+    else
+        echo "WARNING: Docker Compose v2 is not installed; Xray setup will refuse to continue."
+    fi
     if docker info >/dev/null 2>&1; then
         echo "Docker daemon: healthy"
         echo "Containers (names, image, published ports, Compose project):"
