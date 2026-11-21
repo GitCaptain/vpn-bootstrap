@@ -38,3 +38,16 @@ Official references:
 - https://docs.amnezia.org/documentation/instructions/install-vpn-on-server/
 - https://docs.amnezia.org/documentation/supported-linux-os-for-vps/
 - https://docs.amnezia.org/troubleshooting/error-codes/
+
+## SSH key format compatibility
+
+The AmneziaVPN FAQ explicitly lists RSA (2048/3072/4096) and ECDSA
+(nistp256) SSH keys; its SSH error-code guide additionally mentions
+OpenSSH ED25519 and PEM private-key formats. Because these pages are not
+fully consistent, verify your **specific app version's** private-key parser.
+For broadly documented compatibility, a dedicated ECDSA nistp256 private key
+in PEM format is a reasonable starting point; never reuse the VPS admin key.
+
+Sources:
+- https://docs.amnezia.org/ru/faq/
+- https://docs.amnezia.org/troubleshooting/error-codes/
