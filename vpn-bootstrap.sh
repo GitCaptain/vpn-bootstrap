@@ -547,17 +547,29 @@ else
     echo "Created user: $VPN_USER"
 fi
 
-usermod --shell /bin/bash "$VPN_USER"
-usermod -aG sudo "$VPN_USER"
-passwd -l "$VPN_USER" >/dev/null 2>&1 || true
+if [[ "$(getent passwd "$VPN_USER" | cut -d: -f7)" != /bin/bash ]]; then
+    usermod --shell /bin/bash "$VPN_USER"
+fi
+if ! id -nG "$VPN_USER" | tr ' ' '\n' | grep -Fxq sudo; then
+    usermod -aG sudo "$VPN_USER"
+fi
+VPN_SHADOW="$(getent shadow "$VPN_USER" | cut -d: -f2)"
+if [[ "$VPN_SHADOW" != '!'* && "$VPN_SHADOW" != '*'* ]]; then
+    passwd -l "$VPN_USER" >/dev/null
+fi
 
 SUDOERS_FILE="/etc/sudoers.d/90-vpn-management-${VPN_USER}"
-SUDOERS_TMP="$(mktemp)"
-printf '%s ALL=(ALL:ALL) NOPASSWD: ALL\n' "$VPN_USER" > "$SUDOERS_TMP"
-chmod 0440 "$SUDOERS_TMP"
-visudo -cf "$SUDOERS_TMP" >/dev/null
-install -o root -g root -m 0440 "$SUDOERS_TMP" "$SUDOERS_FILE"
-rm -f "$SUDOERS_TMP"
+SUDOERS_EXPECTED="$VPN_USER ALL=(ALL:ALL) NOPASSWD: ALL"
+if [[ ! -f "$SUDOERS_FILE" ||
+      "$(cat "$SUDOERS_FILE")" != "$SUDOERS_EXPECTED" ||
+      "$(stat -c %a "$SUDOERS_FILE")" != 440 ]]; then
+    SUDOERS_TMP="$(mktemp)"
+    printf '%s\n' "$SUDOERS_EXPECTED" > "$SUDOERS_TMP"
+    chmod 0440 "$SUDOERS_TMP"
+    visudo -cf "$SUDOERS_TMP" >/dev/null
+    install -o root -g root -m 0440 "$SUDOERS_TMP" "$SUDOERS_FILE"
+    rm -f "$SUDOERS_TMP"
+fi
 
 USER_HOME="$(getent passwd "$VPN_USER" | cut -d: -f6)"
 [[ -n "$USER_HOME" && "$USER_HOME" != "/" ]] || die "Invalid home directory for $VPN_USER."
