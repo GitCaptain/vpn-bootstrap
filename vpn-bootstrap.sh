@@ -668,7 +668,9 @@ systemctl start apt-daily.timer apt-daily-upgrade.timer >/dev/null 2>&1 || true
 # ------------------------------------------------------------------------------
 
 log "DOCKER ENGINE"
+DOCKER_PREEXISTING=0
 if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
+    DOCKER_PREEXISTING=1
     echo "Functional Docker installation already exists; reusing it."
 elif command -v docker >/dev/null 2>&1; then
     # Existing AmneziaWG containers may depend on this Docker daemon.
@@ -731,40 +733,47 @@ if ! docker compose version >/dev/null 2>&1; then
 fi
 echo "Compose: $(docker compose version)"
 
-# Keep Docker logs bounded and keep containers alive across daemon upgrades when possible.
-DOCKER_DAEMON_JSON="/etc/docker/daemon.json"
-DOCKER_DAEMON_TMP="$(mktemp)"
-if [[ -s "$DOCKER_DAEMON_JSON" ]]; then
-    jq empty "$DOCKER_DAEMON_JSON" || die "$DOCKER_DAEMON_JSON contains invalid JSON."
-    jq '. + {"live-restore": true, "log-driver": "json-file", "log-opts": ((.["log-opts"] // {}) + {"max-size":"10m","max-file":"3"})}' \
-        "$DOCKER_DAEMON_JSON" > "$DOCKER_DAEMON_TMP"
+# Never mutate or restart an already-running Docker daemon: it may host the
+# existing AmneziaWG backup.  Logging defaults and live-restore are
+# host-global and not safe to change during Xray-only provisioning.
+if [[ "$DOCKER_PREEXISTING" -eq 1 ]]; then
+    echo "Pre-existing Docker daemon configuration and running containers preserved."
 else
-    jq -n '{"live-restore": true, "log-driver":"json-file", "log-opts":{"max-size":"10m","max-file":"3"}}' \
-        > "$DOCKER_DAEMON_TMP"
-fi
-
-if [[ ! -f "$DOCKER_DAEMON_JSON" ]] || ! cmp -s "$DOCKER_DAEMON_TMP" "$DOCKER_DAEMON_JSON"; then
-    dockerd --validate --config-file "$DOCKER_DAEMON_TMP" >/dev/null
-    DOCKER_CONFIG_BACKUP="$(mktemp)"
-    DOCKER_CONFIG_EXISTED=0
-    if [[ -f "$DOCKER_DAEMON_JSON" ]]; then
-        cp -a "$DOCKER_DAEMON_JSON" "$DOCKER_CONFIG_BACKUP"
-        DOCKER_CONFIG_EXISTED=1
+    # Keep Docker logs bounded and keep containers alive across daemon upgrades when possible.
+    DOCKER_DAEMON_JSON="/etc/docker/daemon.json"
+    DOCKER_DAEMON_TMP="$(mktemp)"
+    if [[ -s "$DOCKER_DAEMON_JSON" ]]; then
+        jq empty "$DOCKER_DAEMON_JSON" || die "$DOCKER_DAEMON_JSON contains invalid JSON."
+        jq '. + {"live-restore": true, "log-driver": "json-file", "log-opts": ((.["log-opts"] // {}) + {"max-size":"10m","max-file":"3"})}' \
+            "$DOCKER_DAEMON_JSON" > "$DOCKER_DAEMON_TMP"
+    else
+        jq -n '{"live-restore": true, "log-driver":"json-file", "log-opts":{"max-size":"10m","max-file":"3"}}' \
+            > "$DOCKER_DAEMON_TMP"
     fi
-    install -o root -g root -m 0644 "$DOCKER_DAEMON_TMP" "$DOCKER_DAEMON_JSON"
-    if ! systemctl restart docker || ! systemctl is-active --quiet docker; then
-        if [[ "$DOCKER_CONFIG_EXISTED" -eq 1 ]]; then
-            cp -a "$DOCKER_CONFIG_BACKUP" "$DOCKER_DAEMON_JSON"
-        else
-            rm -f "$DOCKER_DAEMON_JSON"
+    
+    if [[ ! -f "$DOCKER_DAEMON_JSON" ]] || ! cmp -s "$DOCKER_DAEMON_TMP" "$DOCKER_DAEMON_JSON"; then
+        dockerd --validate --config-file "$DOCKER_DAEMON_TMP" >/dev/null
+        DOCKER_CONFIG_BACKUP="$(mktemp)"
+        DOCKER_CONFIG_EXISTED=0
+        if [[ -f "$DOCKER_DAEMON_JSON" ]]; then
+            cp -a "$DOCKER_DAEMON_JSON" "$DOCKER_CONFIG_BACKUP"
+            DOCKER_CONFIG_EXISTED=1
         fi
-        systemctl restart docker || warn "Docker recovery failed; inspect journalctl -u docker."
-        rm -f "$DOCKER_CONFIG_BACKUP" "$DOCKER_DAEMON_TMP"
-        die "Docker rejected the new daemon settings; previous configuration restored."
+        install -o root -g root -m 0644 "$DOCKER_DAEMON_TMP" "$DOCKER_DAEMON_JSON"
+        if ! systemctl restart docker || ! systemctl is-active --quiet docker; then
+            if [[ "$DOCKER_CONFIG_EXISTED" -eq 1 ]]; then
+                cp -a "$DOCKER_CONFIG_BACKUP" "$DOCKER_DAEMON_JSON"
+            else
+                rm -f "$DOCKER_DAEMON_JSON"
+            fi
+            systemctl restart docker || warn "Docker recovery failed; inspect journalctl -u docker."
+            rm -f "$DOCKER_CONFIG_BACKUP" "$DOCKER_DAEMON_TMP"
+            die "Docker rejected the new daemon settings; previous configuration restored."
+        fi
+        rm -f "$DOCKER_CONFIG_BACKUP"
     fi
-    rm -f "$DOCKER_CONFIG_BACKUP"
+    rm -f "$DOCKER_DAEMON_TMP"
 fi
-rm -f "$DOCKER_DAEMON_TMP"
 
 # ------------------------------------------------------------------------------
 # Harden SSH
