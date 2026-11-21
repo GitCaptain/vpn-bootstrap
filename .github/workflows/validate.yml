@@ -18,6 +18,7 @@ jobs:
           bash -n amnezia-setup.sh
           bash -n bin/setup-xray-remote.sh
           bash -n bin/audit-vps.sh
+          bash -n bin/guard-awg-remote.sh
           bash -n bin/ensure-vpnadmin-remote.sh
           bash -n bin/root-ssh-policy-remote.sh
           bash -n bin/verify-xray-remote.sh
