@@ -74,7 +74,8 @@ for cmd in ssh ssh-keygen awk bash; do
     command -v "$cmd" >/dev/null || die "Missing $cmd"
 done
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
-for file in bin/ensure-vpnadmin-remote.sh bin/root-ssh-policy-remote.sh; do
+for file in bin/ensure-vpnadmin-remote.sh bin/root-ssh-policy-remote.sh
+            bin/guard-awg-remote.sh; do
     [[ -f "$SCRIPT_DIR/$file" ]] || die "Missing local script $file"
 done
 check_pubkey() {
@@ -153,12 +154,20 @@ admin_ready || die "Cannot establish a NEW vpnadmin SSH session with sudo; root 
 echo "Verified: vpnadmin key-only SSH and passwordless sudo."
 
 if [[ "$PROTOCOL" == xray || "$PROTOCOL" == both ]]; then
+    # Snapshot existing AmneziaWG runtime before Xray provisioning.
+    awg_before="$(run_remote_admin_script "$SCRIPT_DIR/bin/guard-awg-remote.sh")"
+    echo "Existing AmneziaWG Docker fingerprint captured."
     echo "Installing/checking Xray."
     bash "$SCRIPT_DIR/bin/setup-xray-remote.sh" \
         "$SERVER" vpnadmin "$ADMIN_KEY" "$XRAY_PUB" "$PORT" \
         -- --skip-package-upgrade --no-ssh-hardening --no-block-ru --no-firewall
     run_remote_admin_script "$SCRIPT_DIR/bin/verify-xray-remote.sh"
     verify_service_login xray "$XRAY_KEY"
+    awg_after="$(run_remote_admin_script "$SCRIPT_DIR/bin/guard-awg-remote.sh")"
+    if [[ "$awg_before" != NONE && "$awg_before" != "$awg_after" ]]; then
+        die "Existing AmneziaWG Docker container changed, restarted or disappeared; stop before SSH hardening and inspect both VPNs."
+    fi
+    echo "Existing AmneziaWG Docker container identity, start time and published ports unchanged."
 fi
 if [[ "$PROTOCOL" == amnezia || "$PROTOCOL" == both ]]; then
     echo "Installing/checking separate Amnezia SSH manager."
