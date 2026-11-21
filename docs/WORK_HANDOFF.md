@@ -95,3 +95,35 @@ continued work in ChatGPT Work or other code-review sessions.
 - A new chat does not automatically enable Work; current GitHub integration
   is usable in this chat. For context in any new chat, point it to this file
   and both PRs.
+
+## Latest bootstrap requirements (21 Nov 2026, second review)
+
+1. A **single local entrypoint** `bootstrap.sh` selects `--protocol xray`,
+   `amnezia`, or `both` and takes `--server` and SSH key paths.
+2. Repeat runs MUST preserve keys, users, VPN state and other protocol's
+   containers. Xray renderer now detects unchanged config/Compose and skips
+   recreation of the healthy container; Amnezia account setup has a guarded
+   no-op path. The main bootstrap reuses a verified non-root administrator.
+3. SSH identities are **vpnadmin** (persistent fallback/setup administrator),
+   **xray** and **amnezia**, with independent keys. Xray uses a non-root
+   Docker image; official AmneziaWG Docker runtime may require privileged
+   capabilities. Each service has its own container. Sudo access is
+   root-equivalent and thus not a strict security isolation boundary.
+4. A successful bootstrap must leave **root SSH prohibited by password AND
+   by key**. Implemented via `PermitRootLogin no`, automatic scheduled
+   rollback, effective `sshd -T` checks, independent fresh SSH login using
+   `vpnadmin`, and follow-up verification. Failure leaves existing root
+   SSH settings intact or allows automatic restoration.
+5. The AmneziaWG network protocol **officially uses UDP**. It is installed
+   and managed by the official AmneziaVPN Self-hosted app. The local
+   `amnezia-setup.sh` prepares SSH admin access but **does not itself deploy
+   an AmneziaWG container**. A fully unattended headless official
+   AWG installation is NOT completed in this PR; do not claim otherwise.
+6. No server deployments have been made in chat. Both PRs are drafts until
+   VM integration tests including SSH rollback and actual AmneziaVPN install
+   are completed. Static GitHub Actions checks are not sufficient.
+
+References:
+- https://docs.amnezia.org/documentation/instructions/install-vpn-on-server/
+- https://docs.amnezia.org/documentation/instructions/new-amneziawg-selfhosted/
+- https://man.openbsd.org/sshd_config
