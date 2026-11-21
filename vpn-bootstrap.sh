@@ -990,7 +990,9 @@ jq -Rn \
         server_ipv6:$server_ipv6,
         ipv6_egress_ok:$ipv6_ok
     }' > "$STATE_TMP" <<< "$REALITY_PRIVATE_KEY"
-install -o root -g root -m 0600 "$STATE_TMP" "$STATE_FILE"
+if [[ ! -f "$STATE_FILE" ]] || ! cmp -s "$STATE_TMP" "$STATE_FILE"; then
+    install -o root -g root -m 0600 "$STATE_TMP" "$STATE_FILE"
+fi
 rm -f "$STATE_TMP"
 
 # ------------------------------------------------------------------------------
@@ -1201,6 +1203,23 @@ chmod 0644 "$CONFIG_TMP"
 
 # Validate the new configuration before replacing the live one.
 # Keep Xray's diagnostic output so a configuration failure is actionable.
+# No-op on reruns: do not pull images, recreate containers, or touch bind
+# mounts when the desired configuration is identical and Xray is healthy.
+# Force a deploy only if the image/config/compose changed or service is down.
+if [[ -f "$XRAY_DIR/config.json" && -f "$COMPOSE_FILE" ]] &&
+   cmp -s "$CONFIG_TMP" "$XRAY_DIR/config.json" &&
+   [[ "$(docker inspect -f '{{.Config.Image}} {{.State.Running}}' "$XRAY_CONTAINER" 2>/dev/null || true)" == "$XRAY_IMAGE true" ]] &&
+   nc -4 -z -w 2 127.0.0.1 "$XRAY_PORT" >/dev/null 2>&1; then
+    # Compose content is generated later; avoid an early exit until it, too,
+    # is compared with the previously applied desired state.
+    CONFIG_UNCHANGED=1
+else
+    CONFIG_UNCHANGED=0
+fi
+
+# Run a syntax validation on changed configs before any live mutation. An
+# unchanged, running deployment can be left untouched without pulling.
+if [[ "$CONFIG_UNCHANGED" -eq 0 ]]; then
 docker pull "$XRAY_IMAGE" >/dev/null
 
 if docker run --rm \
@@ -1217,6 +1236,7 @@ else
     echo "----------------------------------" >&2
     exit "$rc"
 fi
+fi  # new/changed Xray config
 
 # Use the normal Docker bridge model. The official Xray image remains non-root
 # and listens on an unprivileged container port. Docker publishes the requested
@@ -1257,6 +1277,21 @@ chmod 0600 "$COMPOSE_TMP"
 cd "$VPN_ROOT"
 # Relative volume paths are resolved against VPN_ROOT even for the candidate file.
 docker compose --project-directory "$VPN_ROOT" -f "$COMPOSE_TMP" config -q
+if [[ "$CONFIG_UNCHANGED" -eq 1 ]] &&
+   cmp -s "$COMPOSE_TMP" "$COMPOSE_FILE"; then
+    echo "Xray configuration unchanged and container healthy; skipping recreation."
+    exit 0
+fi
+
+# A modified Compose file needs the normal validated deployment path even if
+# config.json is unchanged.
+if [[ "$CONFIG_UNCHANGED" -eq 1 ]]; then
+    docker pull "$XRAY_IMAGE" >/dev/null
+    docker run --rm --network none \
+        -v "$CONFIG_TMP:/etc/xray/config.json:ro" "$XRAY_IMAGE" \
+        run -test -config /etc/xray/config.json >"$VALIDATION_LOG" 2>&1 ||
+        { cat "$VALIDATION_LOG" >&2; exit 1; }
+fi
 DEPLOY_PENDING=1
 install -o root -g root -m 0644 "$CONFIG_TMP" "$XRAY_DIR/config.json"
 install -o root -g root -m 0600 "$COMPOSE_TMP" "$COMPOSE_FILE"
