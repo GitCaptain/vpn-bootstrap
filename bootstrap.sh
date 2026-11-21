@@ -74,7 +74,7 @@ for cmd in ssh ssh-keygen awk bash; do
     command -v "$cmd" >/dev/null || die "Missing $cmd"
 done
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
-for file in bin/ensure-vpnadmin-remote.sh bin/root-ssh-policy-remote.sh
+for file in bin/ensure-vpnadmin-remote.sh bin/root-ssh-policy-remote.sh \
             bin/guard-awg-remote.sh; do
     [[ -f "$SCRIPT_DIR/$file" ]] || die "Missing local script $file"
 done
