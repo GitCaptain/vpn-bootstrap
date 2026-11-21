@@ -1,0 +1,19 @@
+name: Validate VPN bootstrap and sing-box generator
+
+on:
+  pull_request:
+  push:
+    branches:
+      - fix/selective-xray-routing-2026-11
+
+jobs:
+  static-checks:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check Bash syntax
+        run: bash -n vpn-bootstrap.sh
+      - name: Check Python syntax
+        run: python3 -m py_compile clients/generate_singbox.py
+      - name: Run client generator tests
+        run: python3 -m unittest discover -s clients/tests -v
