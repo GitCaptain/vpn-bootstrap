@@ -51,7 +51,7 @@ fi
 REVERT
         chmod 0700 "$dir/revert.sh"
         token="$(basename "$dir")"
-        unit="vpn-root-rollback-$token"
+        unit="vpnrootrollback${token//[^a-zA-Z0-9]/}"
         # Arm recovery BEFORE changing the SSH daemon configuration.
         systemd-run --quiet --on-active=240s --unit="$unit" \
             /bin/bash "$dir/revert.sh" "$dir" ||
@@ -87,7 +87,8 @@ REVERT
         [[ "$(root_effective)" == no ]] ||
             { echo "ERROR: root is still permitted by effective SSH settings" >&2; exit 1; }
         touch "$dir/confirmed"
-        systemctl stop "vpn-root-rollback-$token.timer" >/dev/null 2>&1 || true
+        unit="vpnrootrollback${token//[^a-zA-Z0-9]/}"
+        systemctl stop "$unit.timer" >/dev/null 2>&1 || true
         echo "Confirmed root SSH prohibited; timer disarmed."
         ;;
     *)
