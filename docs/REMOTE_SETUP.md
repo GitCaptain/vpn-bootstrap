@@ -69,3 +69,14 @@ client install another Xray instance into this VPS.
 Documentation:
 - https://docs.amnezia.org/documentation/supported-linux-os-for-vps/
 - https://docs.amnezia.org/troubleshooting/error-codes/
+
+## 2026 Linux kernel security review
+
+Before deploying/operating a publicly reachable VPS, verify the kernel's
+status for **CVE-2026-98432** and the exposure of MPTCP listeners. Amnezia
+warns that affected kernels require a distribution security fix **and reboot**;
+Xray has also changed its MPTCP defaults in newer releases. Do not
+blindly upgrade Xray to an incompatible REALITY version, and do not assume
+that simply rebuilding the container patches the host kernel.
+
+Official notice: https://docs.amnezia.org/documentation/instructions/update-server-cve-2026-98432/
