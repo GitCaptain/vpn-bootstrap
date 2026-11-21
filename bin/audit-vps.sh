@@ -74,6 +74,35 @@ if command -v sshd >/dev/null; then
     sshd -T -C user=root,host=localhost,addr=127.0.0.1,laddr=127.0.0.1,lport=22 |
         grep -E '^(permitrootlogin|passwordauthentication|pubkeyauthentication|kbdinteractiveauthentication) ' || true
 fi
+printf '\nExisting Amnezia SSH management (read-only):\n'
+if id amnezia >/dev/null 2>&1; then
+    if command -v sudo >/dev/null 2>&1 &&
+       runuser -u amnezia -- sudo -n true >/dev/null 2>&1; then
+        echo "  amnezia passwordless sudo: OK"
+    else
+        echo "  amnezia passwordless sudo: NOT WORKING (verify before root lockout)"
+    fi
+    if command -v sshd >/dev/null 2>&1; then
+        sshd -T -C user=amnezia,host=localhost,addr=127.0.0.1,laddr=127.0.0.1,lport=22 |
+            grep -E '^(pubkeyauthentication|passwordauthentication|authenticationmethods|kbdinteractiveauthentication) ' |
+            sed 's/^/  /' || true
+    fi
+    if command -v passwd >/dev/null 2>&1; then
+        passwd -S amnezia | awk '{print "  amnezia password state: "$2" (L=locked; P=set; NP=no password)"}'
+    fi
+fi
+printf '\nExisting Amnezia Docker service (public metadata only):\n'
+if docker info >/dev/null 2>&1; then
+    for container in $(docker ps -a --format '{{.Names}}' | grep '^amnezia-' || true); do
+        docker inspect -f \
+            '  {{.Name}} | ID={{.Id}} | running={{.State.Running}} | restarted={{.RestartCount}} | started={{.State.StartedAt}} | ports={{json .HostConfig.PortBindings}}' \
+            "$container" || true
+    done
+fi
+printf '\nResources available:\n'
+df -h / | tail -n 1 || true
+free -h | head -n 2 || true
+
 printf '\nXray state, if any:\n'
 if [[ -d /opt/vpn-stack ]]; then
     for path in /opt/vpn-stack/state.json /opt/vpn-stack/users.json /opt/vpn-stack/compose.yml; do
