@@ -1,0 +1,19 @@
+name: Amnezia SSH preparation checks
+
+on:
+  pull_request:
+  push:
+    branches:
+      - fix/amnezia-key-only-remote-2026-11
+
+jobs:
+  bash-check:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate Bash syntax
+        run: bash -n amnezia-setup.sh
+      - name: Check that key authentication is enabled
+        run: |
+          grep -q 'PubkeyAuthentication=yes' amnezia-setup.sh
+          grep -q 'usermod -L' amnezia-setup.sh
