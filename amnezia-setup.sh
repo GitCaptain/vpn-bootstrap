@@ -2,10 +2,12 @@
 set -Eeuo pipefail
 
 # Usage:
-# ./amnezia-setup.sh SERVER_IP ADMIN_USER PUBLIC_KEY [SSH_PORT] [NEW_USER] [NEW_PASSWORD]
+# ./amnezia-setup.sh SERVER_IP ADMIN_USER PUBLIC_KEY [SSH_PORT] [NEW_USER]
+# The Amnezia SSH account is always key-only, with its password locked.
+# Set AMNEZIA_ADMIN_SSH_KEY=~/.ssh/admin if the provisioning admin uses a key.
 
-if [[ $# -lt 3 || $# -gt 6 ]]; then
-    echo "Usage: $0 SERVER_IP ADMIN_USER PUBLIC_KEY [SSH_PORT] [NEW_USER] [NEW_PASSWORD]"
+if [[ $# -lt 3 || $# -gt 5 ]]; then
+    echo "Usage: $0 SERVER_IP ADMIN_USER PUBLIC_KEY [SSH_PORT] [NEW_USER]"
     exit 1
 fi
 
@@ -14,7 +16,6 @@ ADMIN_USER="$2"
 PUBKEY_FILE="$3"
 SSH_PORT="${4:-22}"
 TARGET_USER="${5:-amnezia}"
-TARGET_PASSWORD="${6:-amnezia}"
 
 for cmd in ssh ssh-keygen base64 awk; do
     command -v "$cmd" >/dev/null 2>&1 || {
@@ -42,20 +43,6 @@ fi
 
 if [[ ! "$TARGET_USER" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]]; then
     echo "ERROR: Invalid Linux username."
-    exit 1
-fi
-
-if [[ "$TARGET_PASSWORD" == "-" ]]; then
-    printf "New password for %s: " "$TARGET_USER" >&2
-    IFS= read -r -s TARGET_PASSWORD </dev/tty
-    printf "\n" >&2
-fi
-
-if [[ -z "$TARGET_PASSWORD" ||
-      "$TARGET_PASSWORD" == *:* ||
-      "$TARGET_PASSWORD" == *$'\n'* ||
-      "$TARGET_PASSWORD" == *$'\r'* ]]; then
-    echo "ERROR: Invalid password."
     exit 1
 fi
 
@@ -88,53 +75,26 @@ encode() {
 }
 
 TARGET_USER_B64=$(encode "$TARGET_USER")
-TARGET_PASSWORD_B64=$(encode "$TARGET_PASSWORD")
 PUBKEY_B64=$(encode "$PUBKEY_LINE")
-
-SUDO_PASSWORD_B64=""
-
-if [[ "$ADMIN_USER" != "root" ]]; then
-    printf "Sudo password for %s (Enter if passwordless sudo): " \
-        "$ADMIN_USER" >&2
-
-    IFS= read -r -s SUDO_PASSWORD </dev/tty
-    printf "\n" >&2
-
-    SUDO_PASSWORD_B64=$(encode "$SUDO_PASSWORD")
-    unset SUDO_PASSWORD
-fi
-
-unset TARGET_PASSWORD
 
 # --------------------------------------------------
 # Remote privilege escalation
 # --------------------------------------------------
 
-REMOTE_COMMAND='
-set -eu
+# The provisioning SSH account must be root or already have passwordless sudo.
+# Do not transfer its sudo password through a base64-encoded SSH pipeline.
+REMOTE_COMMAND='if [ "$(id -u)" -eq 0 ]; then exec bash -s; else exec sudo -n bash -s; fi'
 
-if [ "$(id -u)" -eq 0 ]; then
-    exec bash -s
-fi
-
-IFS= read -r SUDO_PASSWORD_B64 || {
-    echo "ERROR: Cannot read sudo credentials." >&2
-    exit 1
-}
-
-if ! sudo -n true >/dev/null 2>&1; then
-    SUDO_PASSWORD=$(printf "%s" "$SUDO_PASSWORD_B64" | base64 -d)
-
-    if ! printf "%s\n" "$SUDO_PASSWORD" | sudo -S -p "" -v; then
-        echo "ERROR: Sudo authentication failed." >&2
+# Optional private key for the *existing admin* SSH login. The public key
+# argument is for the newly prepared amnezia account, not the admin account.
+SSH_IDENTITY_ARGS=()
+if [[ -n "${AMNEZIA_ADMIN_SSH_KEY:-}" ]]; then
+    [[ -r "$AMNEZIA_ADMIN_SSH_KEY" ]] || {
+        echo "ERROR: AMNEZIA_ADMIN_SSH_KEY is not readable." >&2
         exit 1
-    fi
+    }
+    SSH_IDENTITY_ARGS=(-i "$AMNEZIA_ADMIN_SSH_KEY" -o IdentitiesOnly=yes)
 fi
-
-unset SUDO_PASSWORD SUDO_PASSWORD_B64
-
-exec sudo -n bash -s
-'
 
 echo "===================================="
 echo "Server:      $SERVER_HOST"
@@ -143,21 +103,14 @@ echo "New user:    $TARGET_USER"
 echo "SSH port:    $SSH_PORT"
 echo "===================================="
 
-if [[ "$TARGET_PASSWORD_B64" == "$(encode amnezia)" ]]; then
-    echo "WARNING: Using default password."
-fi
+echo "Target account password will be locked. Use its SSH private key in AmneziaVPN."
 
 echo
-echo "Connecting using PASSWORD authentication only..."
+echo "Connecting using SSH (public key preferred; password for bootstrap admin if necessary)..."
 echo
 
 {
-    if [[ "$ADMIN_USER" != "root" ]]; then
-        printf '%s\n' "$SUDO_PASSWORD_B64"
-    fi
-
     printf 'TARGET_USER_B64=%s\n' "$TARGET_USER_B64"
-    printf 'TARGET_PASSWORD_B64=%s\n' "$TARGET_PASSWORD_B64"
     printf 'PUBKEY_B64=%s\n' "$PUBKEY_B64"
     printf 'SSH_PORT=%s\n' "$SSH_PORT"
 
@@ -166,7 +119,6 @@ echo
 set -Eeuo pipefail
 
 TARGET_USER=$(printf '%s' "$TARGET_USER_B64" | base64 -d)
-TARGET_PASSWORD=$(printf '%s' "$TARGET_PASSWORD_B64" | base64 -d)
 PUBKEY=$(printf '%s' "$PUBKEY_B64" | base64 -d)
 
 SSH_CONFIG="/etc/ssh/sshd_config"
@@ -178,7 +130,7 @@ if [[ "$(id -u)" -ne 0 ]]; then
     exit 1
 fi
 
-for cmd in useradd usermod chpasswd getent sshd \
+for cmd in useradd usermod getent sshd \
            ssh-keygen systemctl base64 visudo runuser; do
     command -v "$cmd" >/dev/null 2>&1 || {
         echo "ERROR: Required server command not found: $cmd"
@@ -196,22 +148,61 @@ if ! getent group sudo >/dev/null 2>&1; then
     exit 1
 fi
 
+# Fast idempotent path. No changes to SSH, users, passwords or sudoers when
+# the account already matches the required official AmneziaVPN prerequisites.
+if id "$TARGET_USER" >/dev/null 2>&1; then
+    existing_home="$(getent passwd "$TARGET_USER" | cut -d: -f6)"
+    existing_shadow="$(getent shadow "$TARGET_USER" | cut -d: -f2)"
+    expected_block="$(printf '%s\n' \
+        '# BEGIN AMNEZIA-SSH-KEY-ONLY' \
+        "Match User $TARGET_USER" \
+        '    PubkeyAuthentication yes' \
+        '    AuthenticationMethods publickey' \
+        '    PasswordAuthentication no' \
+        '    KbdInteractiveAuthentication no' \
+        '# END AMNEZIA-SSH-KEY-ONLY')"
+    expected_sudoers="$TARGET_USER ALL=(ALL:ALL) NOPASSWD: ALL"
+    effective="$(sshd -T -f "$SSH_CONFIG" \
+        -C "user=$TARGET_USER,host=localhost,addr=127.0.0.1,laddr=127.0.0.1,lport=$SSH_PORT" 2>/dev/null || true)"
+    if [[ -n "$existing_home" && "$existing_home" != "/" ]] &&
+       [[ "$(getent passwd "$TARGET_USER" | cut -d: -f7)" == /bin/bash ]] &&
+       [[ "$existing_shadow" == '!'* || "$existing_shadow" == '*'* ]] &&
+       [[ -f "$existing_home/.ssh/authorized_keys" ]] &&
+       grep -Fxq -- "$PUBKEY" "$existing_home/.ssh/authorized_keys" &&
+       id -nG "$TARGET_USER" | tr ' ' '\n' | grep -Fxq sudo; then
+        if [[ -f "$SUDOERS_FILE" ]] &&
+           [[ "$(cat "$SUDOERS_FILE")" == "$expected_sudoers" ]] &&
+           [[ "$(stat -c %a "$SUDOERS_FILE")" == 440 ]] &&
+           [[ "$(tail -n 7 "$SSH_CONFIG")" == "$expected_block" ]] &&
+           [[ "$(grep -Fxc '# BEGIN AMNEZIA-SSH-KEY-ONLY' "$SSH_CONFIG")" == 1 ]] &&
+           grep -Fxq 'pubkeyauthentication yes' <<< "$effective" &&
+           grep -Fxq 'authenticationmethods publickey' <<< "$effective" &&
+           grep -Fxq 'passwordauthentication no' <<< "$effective" &&
+           grep -Fxq 'kbdinteractiveauthentication no' <<< "$effective" &&
+           runuser -u "$TARGET_USER" -- sudo -n true; then
+            echo "Amnezia SSH administrator already configured: unchanged."
+            exit 0
+        fi
+    fi
+fi
+
 # --------------------------------------------------
 # Create or update user
 # --------------------------------------------------
 
 if id "$TARGET_USER" >/dev/null 2>&1; then
     echo "User already exists: $TARGET_USER"
-    usermod -s /bin/bash "$TARGET_USER"
+    if [[ "$(getent passwd "$TARGET_USER" | cut -d: -f7)" != /bin/bash ]]; then
+        usermod -s /bin/bash "$TARGET_USER"
+    fi
 else
     useradd -m -s /bin/bash "$TARGET_USER"
     echo "Created user: $TARGET_USER"
 fi
 
-printf '%s:%s\n' "$TARGET_USER" "$TARGET_PASSWORD" | chpasswd
-unset TARGET_PASSWORD
-
-usermod -aG sudo "$TARGET_USER"
+if ! id -nG "$TARGET_USER" | tr ' ' '\n' | grep -Fxq sudo; then
+    usermod -aG sudo "$TARGET_USER"
+fi
 
 echo "Sudo group configured."
 
@@ -391,6 +382,14 @@ else
     exit 1
 fi
 
+# Only lock an existing account password after the public key has been
+# installed and the new SSH configuration has been validated and reloaded.
+# Never risk locking the previous login during a failed setup step.
+shadow_password="$(getent shadow "$TARGET_USER" | cut -d: -f2)"
+if [[ "$shadow_password" != '!'* && "$shadow_password" != '*'* ]]; then
+    usermod -L "$TARGET_USER"
+fi
+
 echo
 echo "======================================"
 echo "SUCCESS!"
@@ -410,13 +409,14 @@ REMOTE_SCRIPT
 
 } | ssh -T \
     -p "$SSH_PORT" \
-    -o PubkeyAuthentication=no \
-    -o PreferredAuthentications=password,keyboard-interactive \
+    -o PubkeyAuthentication=yes \
+    -o PreferredAuthentications=publickey,password,keyboard-interactive \
     -o NumberOfPasswordPrompts=3 \
     -o BatchMode=no \
     -o GSSAPIAuthentication=no \
     -o HostbasedAuthentication=no \
     -o StrictHostKeyChecking=ask \
+    "${SSH_IDENTITY_ARGS[@]}" \
     "$ADMIN_USER@$SERVER_HOST" \
     "$REMOTE_COMMAND"
 
