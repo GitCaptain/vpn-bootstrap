@@ -17,6 +17,8 @@ fi
 home="$(getent passwd "$account" | cut -d: -f6)"
 [[ -n "$home" && "$home" != "/" && -d "$home" ]] ||
     { echo "ERROR: unsafe admin home" >&2; exit 1; }
+[[ ! -L "$home/.ssh" && ! -L "$home/.ssh/authorized_keys" ]] ||
+    { echo "ERROR: administrative SSH paths must not be symlinks" >&2; exit 1; }
 group="$(id -gn "$account")"
 install -d -m 0700 -o "$account" -g "$group" "$home/.ssh"
 keys="$home/.ssh/authorized_keys"
@@ -29,6 +31,10 @@ fi
 chown "$account:$group" "$keys"
 chmod 0600 "$keys"
 chmod go-w "$home"
+shadow="$(getent shadow "$account" | cut -d: -f2)"
+if [[ "$shadow" != '!'* && "$shadow" != '*'* ]]; then
+    usermod -L "$account"
+fi
 if ! id -nG "$account" | tr ' ' '\n' | grep -Fxq sudo; then
     usermod -aG sudo "$account"
 fi
