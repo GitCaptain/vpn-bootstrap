@@ -148,6 +148,44 @@ if ! getent group sudo >/dev/null 2>&1; then
     exit 1
 fi
 
+# Fast idempotent path. No changes to SSH, users, passwords or sudoers when
+# the account already matches the required official AmneziaVPN prerequisites.
+if id "$TARGET_USER" >/dev/null 2>&1; then
+    existing_home="$(getent passwd "$TARGET_USER" | cut -d: -f6)"
+    existing_shadow="$(getent shadow "$TARGET_USER" | cut -d: -f2)"
+    expected_block="$(printf '%s\n' \
+        '# BEGIN AMNEZIA-SSH-KEY-ONLY' \
+        "Match User $TARGET_USER" \
+        '    PubkeyAuthentication yes' \
+        '    AuthenticationMethods publickey' \
+        '    PasswordAuthentication no' \
+        '    KbdInteractiveAuthentication no' \
+        '# END AMNEZIA-SSH-KEY-ONLY')"
+    expected_sudoers="$TARGET_USER ALL=(ALL:ALL) NOPASSWD: ALL"
+    effective="$(sshd -T -f "$SSH_CONFIG" \
+        -C "user=$TARGET_USER,host=localhost,addr=127.0.0.1,laddr=127.0.0.1,lport=$SSH_PORT" 2>/dev/null || true)"
+    if [[ -n "$existing_home" && "$existing_home" != "/" ]] &&
+       [[ "$(getent passwd "$TARGET_USER" | cut -d: -f7)" == /bin/bash ]] &&
+       [[ "$existing_shadow" == '!'* || "$existing_shadow" == '*'* ]] &&
+       [[ -f "$existing_home/.ssh/authorized_keys" ]] &&
+       grep -Fxq -- "$PUBKEY" "$existing_home/.ssh/authorized_keys" &&
+       id -nG "$TARGET_USER" | tr ' ' '\n' | grep -Fxq sudo; then
+        if [[ -f "$SUDOERS_FILE" ]] &&
+           [[ "$(cat "$SUDOERS_FILE")" == "$expected_sudoers" ]] &&
+           [[ "$(stat -c %a "$SUDOERS_FILE")" == 440 ]] &&
+           [[ "$(tail -n 7 "$SSH_CONFIG")" == "$expected_block" ]] &&
+           [[ "$(grep -Fxc '# BEGIN AMNEZIA-SSH-KEY-ONLY' "$SSH_CONFIG")" == 1 ]] &&
+           grep -Fxq 'pubkeyauthentication yes' <<< "$effective" &&
+           grep -Fxq 'authenticationmethods publickey' <<< "$effective" &&
+           grep -Fxq 'passwordauthentication no' <<< "$effective" &&
+           grep -Fxq 'kbdinteractiveauthentication no' <<< "$effective" &&
+           runuser -u "$TARGET_USER" -- sudo -n true; then
+            echo "Amnezia SSH administrator already configured: unchanged."
+            exit 0
+        fi
+    fi
+fi
+
 # --------------------------------------------------
 # Create or update user
 # --------------------------------------------------
