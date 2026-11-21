@@ -14,7 +14,8 @@ set -Eeuo pipefail
 #   - Xray-core: VLESS + XTLS Vision + REALITY
 #   - Xray runs as the official image's non-root user on a Docker bridge network
 #     (host VPN port is published to an unprivileged container port)
-#   - Optional blocking of Russian IP destinations and .ru/.su/.рф domains
+#   - Optional, explicit opt-in blocking of Russian destinations on Xray.
+#     Selective site/app routing is done on sing-box clients (default: direct).
 #   - Persistent per-device VPN user management commands
 #
 # The script is incremental/idempotent:
@@ -40,7 +41,7 @@ set -Eeuo pipefail
 #                             The exact stable version is pinned for reproducibility;
 #                             every run checks GitHub's latest stable release and warns
 #                             when the configured version is outdated.
-#   --block-ru                Enable RU destination blocking (default on first install).
+#   --block-ru                Enable RU destination blocking (opt-in on first install).
 #   --no-block-ru             Disable RU destination blocking.
 #   --no-firewall             Do not configure/enable UFW.
 #   --harden-ssh              Second step: run via sudo from the management user.
@@ -117,7 +118,7 @@ Options:
   --xray-image IMAGE          Pin a specific Xray Docker image.
                               Default on first install: ghcr.io/xtls/xray-core:26.3.27.
   --block-ru                  Block Russian IP destinations and .ru/.su/.рф domains.
-                              Enabled by default on first install.
+                              Disabled by default on first install.
   --no-block-ru               Disable RU destination blocking.
   --no-firewall               Do not configure or enable UFW.
   --harden-ssh                Second step, after testing a new management-user SSH login.
@@ -936,7 +937,7 @@ else
     XRAY_IMAGE="${XRAY_IMAGE_ARG:-$DEFAULT_XRAY_IMAGE}"
     XRAY_PORT="${XRAY_PORT_ARG:-$DEFAULT_XRAY_PORT}"
     REALITY_TARGET="${REALITY_TARGET_ARG:-$DEFAULT_REALITY_TARGET}"
-    BLOCK_RU="${BLOCK_RU_ARG:-true}"
+    BLOCK_RU="${BLOCK_RU_ARG:-false}"
 
     if [[ -n "$ENDPOINT_ARG" ]]; then
         ENDPOINT_MODE="manual"
@@ -1004,15 +1005,23 @@ check_xray_version "$XRAY_IMAGE"
 # ------------------------------------------------------------------------------
 
 log "REALITY TARGET CHECK"
-if timeout 12 openssl s_client \
+# Validate both the certificate identity and HTTP/2 ALPN negotiation.  Merely
+# seeing "TLSv1.3" in openssl output can accept a mismatched or broken target.
+TLS_PROBE_OUTPUT=""
+if TLS_PROBE_OUTPUT="$(timeout 12 openssl s_client \
     -connect "${REALITY_TARGET}:443" \
     -servername "$REALITY_TARGET" \
-    -tls1_3 \
-    -brief </dev/null 2>&1 | grep -F 'TLSv1.3' >/dev/null; then
-    echo "REALITY target supports TLS 1.3: $REALITY_TARGET"
+    -tls1_3 -alpn h2 \
+    -verify_hostname "$REALITY_TARGET" \
+    -verify_return_error </dev/null 2>&1)" && \
+    grep -Fq 'ALPN protocol: h2' <<< "$TLS_PROBE_OUTPUT"; then
+    echo "REALITY target TLS 1.3, certificate hostname and HTTP/2: OK"
 else
-    die "REALITY target failed the TLS 1.3 check: $REALITY_TARGET. Use --reality-target HOST."
+    warn "REALITY target diagnostic:"
+    printf '%s\n' "$TLS_PROBE_OUTPUT" | tail -n 12 >&2
+    die "REALITY target TLS 1.3/certificate/HTTP2 check failed: $REALITY_TARGET"
 fi
+unset TLS_PROBE_OUTPUT
 
 # ------------------------------------------------------------------------------
 # Install renderer and management command
@@ -1061,11 +1070,10 @@ else
     NETWORK_IPV6_LINE=""
 fi
 
-if [[ "$IPV6_OK" == "true" ]]; then
-    FREEDOM_STRATEGY="UseIPv6v4"
-else
-    FREEDOM_STRATEGY="UseIPv4"
-fi
+# The host's IPv6 probe does not validate Docker bridge IPv6 egress.
+# Until a network-namespace probe is available, prefer reliable IPv4 DNS
+# resolution.  Existing IPv6 literals still use the kernel routing table.
+FREEDOM_STRATEGY="UseIPv4"
 
 # The official Xray image runs as a non-root user by default. Keep the
 # temporary config inside the root-only VPN directory. The config file itself
@@ -1223,6 +1231,9 @@ services:
     read_only: true
     security_opt:
       - no-new-privileges:true
+    cap_drop:
+      - ALL
+    pids_limit: 128
     ports:
       - "${XRAY_PORT}:${XRAY_CONTAINER_PORT}/tcp"
     networks:
@@ -1328,11 +1339,8 @@ show_user() {
     echo "Primary link:"
     build_link "$name" "$uuid" "$sid" "$ENDPOINT_HOST"
 
-    if [[ "$IPV6_OK" == "true" && -n "$SERVER_IPV6" && "$ENDPOINT_HOST" != "$SERVER_IPV6" ]]; then
-        echo
-        echo "Direct IPv6 link:"
-        build_link "${name}-IPv6" "$uuid" "$sid" "$SERVER_IPV6"
-    fi
+    # Do not advertise a direct IPv6 endpoint merely from host outbound
+    # connectivity. The external Docker-published port may not be reachable.
 }
 
 add_user() {
