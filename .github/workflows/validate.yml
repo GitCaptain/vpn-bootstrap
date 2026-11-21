@@ -12,7 +12,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Check Bash syntax
-        run: bash -n vpn-bootstrap.sh
+        run: |
+          bash -n vpn-bootstrap.sh
+          bash -n bin/setup-xray-remote.sh
       - name: Check Python syntax
         run: python3 -m py_compile clients/generate_singbox.py
       - name: Run client generator tests
