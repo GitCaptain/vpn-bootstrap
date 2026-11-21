@@ -3,7 +3,9 @@ set -Eeuo pipefail
 # Runs on the VPS as root, streamed from the operator's workstation.
 # Creates a stable non-root administrative entrypoint for repeat bootstraps.
 [[ "$(id -u)" == 0 ]] || { echo "ERROR: root required" >&2; exit 1; }
-[[ $# == 1 && "$1" == ssh-*' '* ]] || { echo "ERROR: expected one public SSH key" >&2; exit 2; }
+[[ $# == 1 && "$1" == *' '* ]] || { echo "ERROR: expected one public SSH key" >&2; exit 2; }
+ssh-keygen -lf <(printf '%s\n' "$1") >/dev/null ||
+    { echo "ERROR: invalid public SSH key" >&2; exit 2; }
 pubkey="$1"
 account="vpnadmin"
 if ! id "$account" >/dev/null 2>&1; then
@@ -40,11 +42,20 @@ if [[ ! -f "$policy" || "$(cat "$policy")" != "$desired" ||
     chmod 0440 "$tmp"
     visudo -cf "$tmp" >/dev/null
     # Validate entire configuration using a test file, then atomically move.
+    backup="$(mktemp /etc/sudoers.d/.vpnadmin-old.XXXXXX)"
+    previous=0
+    if [[ -f "$policy" ]]; then
+        cp -a "$policy" "$backup"
+        previous=1
+    fi
     mv -f "$tmp" "$policy"
     if ! visudo -c >/dev/null; then
-        echo "ERROR: sudoers configuration invalid" >&2
+        echo "ERROR: sudoers configuration invalid; restoring previous file" >&2
+        if [[ "$previous" -eq 1 ]]; then cp -a "$backup" "$policy"; else rm -f "$policy"; fi
+        rm -f "$backup"
         exit 1
     fi
+    rm -f "$backup"
     trap - EXIT
 fi
 runuser -u "$account" -- sudo -n true ||
