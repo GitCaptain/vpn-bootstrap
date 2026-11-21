@@ -28,3 +28,30 @@ jobs:
         run: python3 -m py_compile clients/generate_singbox.py
       - name: Run client generator tests
         run: python3 -m unittest discover -s clients/tests -v
+      - name: Validate profiles using sing-box 1.14.4
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          archive="$RUNNER_TEMP/sing-box.tgz"
+          curl --fail --location --silent --show-error \
+            'https://github.com/SagerNet/sing-box/releases/download/v1.14.4/sing-box-1.14.4-linux-amd64.tar.gz' \
+            --output "$archive"
+          tar -xf "$archive" -C "$RUNNER_TEMP"
+          singbox="$RUNNER_TEMP/sing-box-1.14.4-linux-amd64/sing-box"
+          "$singbox" version
+          for platform in android ios macos windows linux; do
+            output="$RUNNER_TEMP/profile-$platform.json"
+            python3 - "$output" "$platform" <<'PY'
+          import json, sys
+          sys.path.insert(0, "clients")
+          from generate_singbox import parse_link, build
+          link = ('vless://5f3877a8-19a2-4e7d-a90f-fc4af125c70b@203.0.113.10:443'
+                  '?encryption=none&flow=xtls-rprx-vision&security=reality'
+                  '&sni=www.example.com&fp=chrome'
+                  '&pbk=ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmno&sid=abcd1234&type=tcp')
+          data = build(parse_link(link), sys.argv[2], proxy_domains=["openai.com"])
+          with open(sys.argv[1], "w", encoding="utf8") as out:
+              json.dump(data, out)
+          PY
+            "$singbox" check -c "$output"
+          done
