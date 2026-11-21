@@ -48,7 +48,7 @@ jobs:
           link = ('vless://5f3877a8-19a2-4e7d-a90f-fc4af125c70b@203.0.113.10:443'
                   '?encryption=none&flow=xtls-rprx-vision&security=reality'
                   '&sni=www.example.com&fp=chrome'
-                  '&pbk=ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmno&sid=abcd1234&type=tcp')
+                  '&pbk=AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8&sid=abcd1234&type=tcp')
           data = build(parse_link(link), sys.argv[2], proxy_domains=["openai.com"])
           with open(sys.argv[1], "w", encoding="utf8") as out:
               json.dump(data, out)
