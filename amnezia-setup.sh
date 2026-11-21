@@ -3,6 +3,9 @@ set -Eeuo pipefail
 
 # Usage:
 # ./amnezia-setup.sh SERVER_IP ADMIN_USER PUBLIC_KEY [SSH_PORT] [NEW_USER] [NEW_PASSWORD]
+# NEW_PASSWORD is an optional legacy override. With no password the account
+# is key-only with locked password, as supported by official AmneziaVPN.
+# Set AMNEZIA_ADMIN_SSH_KEY=~/.ssh/admin if the provisioning admin uses a key.
 
 if [[ $# -lt 3 || $# -gt 6 ]]; then
     echo "Usage: $0 SERVER_IP ADMIN_USER PUBLIC_KEY [SSH_PORT] [NEW_USER] [NEW_PASSWORD]"
@@ -14,7 +17,7 @@ ADMIN_USER="$2"
 PUBKEY_FILE="$3"
 SSH_PORT="${4:-22}"
 TARGET_USER="${5:-amnezia}"
-TARGET_PASSWORD="${6:-amnezia}"
+TARGET_PASSWORD="${6:-}"
 
 for cmd in ssh ssh-keygen base64 awk; do
     command -v "$cmd" >/dev/null 2>&1 || {
@@ -51,8 +54,7 @@ if [[ "$TARGET_PASSWORD" == "-" ]]; then
     printf "\n" >&2
 fi
 
-if [[ -z "$TARGET_PASSWORD" ||
-      "$TARGET_PASSWORD" == *:* ||
+if [[ "$TARGET_PASSWORD" == *:* ||
       "$TARGET_PASSWORD" == *$'\n'* ||
       "$TARGET_PASSWORD" == *$'\r'* ]]; then
     echo "ERROR: Invalid password."
@@ -91,50 +93,26 @@ TARGET_USER_B64=$(encode "$TARGET_USER")
 TARGET_PASSWORD_B64=$(encode "$TARGET_PASSWORD")
 PUBKEY_B64=$(encode "$PUBKEY_LINE")
 
-SUDO_PASSWORD_B64=""
-
-if [[ "$ADMIN_USER" != "root" ]]; then
-    printf "Sudo password for %s (Enter if passwordless sudo): " \
-        "$ADMIN_USER" >&2
-
-    IFS= read -r -s SUDO_PASSWORD </dev/tty
-    printf "\n" >&2
-
-    SUDO_PASSWORD_B64=$(encode "$SUDO_PASSWORD")
-    unset SUDO_PASSWORD
-fi
-
 unset TARGET_PASSWORD
 
 # --------------------------------------------------
 # Remote privilege escalation
 # --------------------------------------------------
 
-REMOTE_COMMAND='
-set -eu
+# The provisioning SSH account must be root or already have passwordless sudo.
+# Do not transfer its sudo password through a base64-encoded SSH pipeline.
+REMOTE_COMMAND='if [ "$(id -u)" -eq 0 ]; then exec bash -s; else exec sudo -n bash -s; fi'
 
-if [ "$(id -u)" -eq 0 ]; then
-    exec bash -s
-fi
-
-IFS= read -r SUDO_PASSWORD_B64 || {
-    echo "ERROR: Cannot read sudo credentials." >&2
-    exit 1
-}
-
-if ! sudo -n true >/dev/null 2>&1; then
-    SUDO_PASSWORD=$(printf "%s" "$SUDO_PASSWORD_B64" | base64 -d)
-
-    if ! printf "%s\n" "$SUDO_PASSWORD" | sudo -S -p "" -v; then
-        echo "ERROR: Sudo authentication failed." >&2
+# Optional private key for the *existing admin* SSH login. The public key
+# argument is for the newly prepared amnezia account, not the admin account.
+SSH_IDENTITY_ARGS=()
+if [[ -n "${AMNEZIA_ADMIN_SSH_KEY:-}" ]]; then
+    [[ -r "$AMNEZIA_ADMIN_SSH_KEY" ]] || {
+        echo "ERROR: AMNEZIA_ADMIN_SSH_KEY is not readable." >&2
         exit 1
-    fi
+    }
+    SSH_IDENTITY_ARGS=(-i "$AMNEZIA_ADMIN_SSH_KEY" -o IdentitiesOnly=yes)
 fi
-
-unset SUDO_PASSWORD SUDO_PASSWORD_B64
-
-exec sudo -n bash -s
-'
 
 echo "===================================="
 echo "Server:      $SERVER_HOST"
@@ -143,19 +121,17 @@ echo "New user:    $TARGET_USER"
 echo "SSH port:    $SSH_PORT"
 echo "===================================="
 
-if [[ "$TARGET_PASSWORD_B64" == "$(encode amnezia)" ]]; then
-    echo "WARNING: Using default password."
+if [[ -n "$TARGET_PASSWORD_B64" ]]; then
+    echo "WARNING: Explicit account password supplied. Key-only SSH login still enforced."
+else
+    echo "Target account password will be locked. Use its SSH private key in AmneziaVPN."
 fi
 
 echo
-echo "Connecting using PASSWORD authentication only..."
+echo "Connecting using SSH (public key preferred; password for bootstrap admin if necessary)..."
 echo
 
 {
-    if [[ "$ADMIN_USER" != "root" ]]; then
-        printf '%s\n' "$SUDO_PASSWORD_B64"
-    fi
-
     printf 'TARGET_USER_B64=%s\n' "$TARGET_USER_B64"
     printf 'TARGET_PASSWORD_B64=%s\n' "$TARGET_PASSWORD_B64"
     printf 'PUBKEY_B64=%s\n' "$PUBKEY_B64"
@@ -208,7 +184,13 @@ else
     echo "Created user: $TARGET_USER"
 fi
 
-printf '%s:%s\n' "$TARGET_USER" "$TARGET_PASSWORD" | chpasswd
+if [[ -n "$TARGET_PASSWORD" ]]; then
+    printf '%s:%s\n' "$TARGET_USER" "$TARGET_PASSWORD" | chpasswd
+else
+    # A password is not needed when the official AmneziaVPN app uses SSH keys.
+    # Lock password login for this account even if an old run set a password.
+    usermod -L "$TARGET_USER"
+fi
 unset TARGET_PASSWORD
 
 usermod -aG sudo "$TARGET_USER"
@@ -410,13 +392,14 @@ REMOTE_SCRIPT
 
 } | ssh -T \
     -p "$SSH_PORT" \
-    -o PubkeyAuthentication=no \
-    -o PreferredAuthentications=password,keyboard-interactive \
+    -o PubkeyAuthentication=yes \
+    -o PreferredAuthentications=publickey,password,keyboard-interactive \
     -o NumberOfPasswordPrompts=3 \
     -o BatchMode=no \
     -o GSSAPIAuthentication=no \
     -o HostbasedAuthentication=no \
     -o StrictHostKeyChecking=ask \
+    "${SSH_IDENTITY_ARGS[@]}" \
     "$ADMIN_USER@$SERVER_HOST" \
     "$REMOTE_COMMAND"
 
