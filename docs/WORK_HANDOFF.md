@@ -69,3 +69,29 @@ continued work in ChatGPT Work or other code-review sessions.
 - Add stable, secure client configuration distribution/provisioning if needed,
   without committing user secrets.
 - Keep Xray PR draft until review and tests; do not merge/deploy automatically.
+
+## Updated local-first deployment architecture (21 Nov 2026)
+- The user will invoke setup scripts on their **own workstation**, passing
+  the destination VPS address. No automatic deployments or GitHub Actions
+  deployments to the VPS.
+- Xray setup: `bin/setup-xray-remote.sh` streams the existing
+  `vpn-bootstrap.sh` over SSH, with an independent `xray` management account.
+  Use an existing root or passwordless-sudo admin for the initial connection.
+  Xray container remains the dedicated `xray-reality` Docker service.
+- Amnezia setup: `amnezia-setup.sh` already runs from the workstation;
+  a separate review PR is open:
+  https://github.com/GitCaptain/vpn-bootstrap/pull/2 (base: amnezia).
+  It creates/maintains independent SSH account `amnezia`, locked password
+  and SSH key only. It deliberately retains unrestricted passwordless sudo
+  per upstream AmneziaVPN installation requirements.
+- AmneziaWG container is installed by official AmneziaVPN Self-hosted UI
+  *after* account prep, and must be separate from Xray. Distinct SSH identities
+  and containers do not equal isolation from root when admins have NOPASSWD
+  sudo; AmneziaWG may need privileged NET_ADMIN in its container.
+- Official AmneziaVPN supports either SSH password or private-key
+  authentication and non-root sudo account with passwordless permissions:
+  https://docs.amnezia.org/documentation/supported-linux-os-for-vps/
+  https://docs.amnezia.org/troubleshooting/error-codes/
+- A new chat does not automatically enable Work; current GitHub integration
+  is usable in this chat. For context in any new chat, point it to this file
+  and both PRs.
