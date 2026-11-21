@@ -18,17 +18,26 @@ class ClientConfigTests(unittest.TestCase):
 
     def test_selected_domains_use_proxy(self):
         conf = build(parse_link(LINK), "ios", proxy_domains=["openai.com"])
-        self.assertIn({"domain_suffix": [".openai.com"], "action": "route",
+        self.assertIn({"domain_suffix": ["openai.com"], "action": "route",
                        "outbound": "proxy"}, conf["route"]["rules"])
-        self.assertIn({"domain_suffix": [".openai.com"], "action": "route",
+        self.assertIn({"domain_suffix": ["openai.com"], "action": "route",
                        "server": "remote-dns"}, conf["dns"]["rules"])
+
+    def test_process_rule_on_macos(self):
+        conf = build(parse_link(LINK), "macos", proxy_processes=["Telegram"])
+        self.assertIn({"process_name": ["Telegram"], "action": "route",
+                       "outbound": "proxy"}, conf["route"]["rules"])
+
+    def test_suffixes_include_apex(self):
+        # sing-box 1.9+: a suffix WITHOUT leading dot matches apex and subdomains.
+        self.assertEqual(domain_suffixes(["openai.com", "*.openai.com"]), ["openai.com"])
 
     def test_no_app_rule_on_ios(self):
         with self.assertRaises(ValueError):
             build(parse_link(LINK), "ios", proxy_apps=["org.telegram.messenger"])
 
     def test_idna(self):
-        self.assertEqual(domain_suffixes(["пример.рф"]), [".xn--e1afmkfd.xn--p1ai"])
+        self.assertEqual(domain_suffixes(["пример.рф"]), ["xn--e1afmkfd.xn--p1ai"])
 
 if __name__ == "__main__":
     unittest.main()
