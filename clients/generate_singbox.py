@@ -16,7 +16,7 @@ from uuid import UUID
 PLATFORMS = ("android", "ios", "macos", "windows", "linux")
 
 def parse_link(raw):
-    match = re.search(r"vless://[^\\s<>\\\"']+", raw)
+    match = re.search(r"vless://[^\s<>"']+", raw)
     if not match:
         raise ValueError("No VLESS URI found in input")
     parsed = urlsplit(match.group(0).rstrip(";,"))
