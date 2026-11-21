@@ -670,6 +670,11 @@ systemctl start apt-daily.timer apt-daily-upgrade.timer >/dev/null 2>&1 || true
 log "DOCKER ENGINE"
 if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
     echo "Functional Docker installation already exists; reusing it."
+elif command -v docker >/dev/null 2>&1; then
+    # Existing AmneziaWG containers may depend on this Docker daemon.
+    # Never uninstall/reinstall Docker while the daemon is unhealthy:
+    # that could destroy the backup VPN's availability and state.
+    die "Docker is installed but unusable. Stop rather than replacing Docker; repair the existing daemon manually and confirm AmneziaWG still works."
 else
     # Remove packages that conflict with Docker CE when a partial/non-working
     # container runtime is already present. Existing Docker data under
@@ -1115,12 +1120,12 @@ cleanup_deployment() {
         if [[ "$HAD_COMPOSE" -eq 1 ]]; then
             cp -a "$DEPLOY_BACKUP/compose.yml" "$COMPOSE_FILE"
             # Recreate: a single-file bind mount may still reference the replaced inode.
-            if ! docker compose --project-directory "$VPN_ROOT" -f "$COMPOSE_FILE" up -d --force-recreate --remove-orphans >&2; then
+            if ! docker compose --project-directory "$VPN_ROOT" -f "$COMPOSE_FILE" up -d --force-recreate >&2; then
                 echo "ERROR: automatic deployment recovery failed; check Docker logs." >&2
             fi
         else
             # Only remove the deployment if Compose actually created it for us.
-            docker compose --project-directory "$VPN_ROOT" -f "$COMPOSE_FILE" down --remove-orphans >&2 || true
+            docker compose --project-directory "$VPN_ROOT" -f "$COMPOSE_FILE" down >&2 || true
             rm -f "$COMPOSE_FILE"
         fi
     fi
@@ -1307,7 +1312,7 @@ fi
 DEPLOY_PENDING=1
 install -o root -g root -m 0644 "$CONFIG_TMP" "$XRAY_DIR/config.json"
 install -o root -g root -m 0600 "$COMPOSE_TMP" "$COMPOSE_FILE"
-docker compose --project-directory "$VPN_ROOT" -f "$COMPOSE_FILE" up -d --force-recreate --remove-orphans
+docker compose --project-directory "$VPN_ROOT" -f "$COMPOSE_FILE" up -d --force-recreate
 
 for _ in $(seq 1 20); do
     if [[ "$(docker inspect -f '{{.State.Running}}' "$XRAY_CONTAINER" 2>/dev/null || true)" == "true" ]] && \
