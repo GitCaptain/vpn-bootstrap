@@ -45,12 +45,16 @@ checks are *not* sufficient for this.
 ## Phase 2: bring up Xray only
 
 After code review and protecting the existing AWG Docker/iptables rules, use the
-local `bootstrap.sh --server VPS_IP --protocol xray` with **independent**
+local `bootstrap.sh --server VPS_IP --protocol xray --confirm-root-ssh-lockout` with **independent**
 `vpnadmin` and `xray` keypairs. This entrypoint passes `--no-firewall`
 and `--skip-package-upgrade` to Xray specifically to avoid resetting UFW or
 unnecessary distribution upgrades. Docker must already be healthy; if the
 installed daemon is unhealthy Xray aborts rather than attempting a Docker
 replacement. Xray's Compose deployment no longer uses `--remove-orphans`.
+
+The entrypoint requires `--confirm-root-ssh-lockout`; this explicit flag
+asserts you have checked AmneziaVPN can still be administered without a root
+SSH login. Without the flag it aborts **before changing the VPS**.
 
 The bootstrap will **disable root SSH** after success, including public key
 and password authentication. Do not run this phase before you verify
