@@ -11,8 +11,8 @@ Usage:
                  [--ssh-user root] [--ssh-key /path/to/initial-admin-key|-]
                  [--ssh-port 22]
                  [--admin-key ~/.ssh/vpnadmin] [--admin-pubkey ~/.ssh/vpnadmin.pub]
-                 [--xray-pubkey ~/.ssh/xray.pub]
-                 [--amnezia-pubkey ~/.ssh/amnezia.pub]
+                 [--xray-key ~/.ssh/xray] [--xray-pubkey ~/.ssh/xray.pub]
+                 [--amnezia-key ~/.ssh/amnezia] [--amnezia-pubkey ~/.ssh/amnezia.pub]
 
 Behavior:
   - Invoke from the local checkout; no script or key is fetched from GitHub.
@@ -32,7 +32,9 @@ INITIAL_KEY="-"
 PORT="22"
 ADMIN_KEY="$HOME/.ssh/vpnadmin"
 ADMIN_PUB="$HOME/.ssh/vpnadmin.pub"
+XRAY_KEY="$HOME/.ssh/xray"
 XRAY_PUB="$HOME/.ssh/xray.pub"
+AMNEZIA_KEY="$HOME/.ssh/amnezia"
 AMNEZIA_PUB="$HOME/.ssh/amnezia.pub"
 while (( $# > 0 )); do
     case "$1" in
@@ -43,7 +45,9 @@ while (( $# > 0 )); do
         --ssh-port) PORT="$2"; shift 2 ;;
         --admin-key) ADMIN_KEY="$2"; shift 2 ;;
         --admin-pubkey) ADMIN_PUB="$2"; shift 2 ;;
+        --xray-key) XRAY_KEY="$2"; shift 2 ;;
         --xray-pubkey) XRAY_PUB="$2"; shift 2 ;;
+        --amnezia-key) AMNEZIA_KEY="$2"; shift 2 ;;
         --amnezia-pubkey) AMNEZIA_PUB="$2"; shift 2 ;;
         -h|--help) usage; exit 0 ;;
         *) usage >&2; die "Unknown option: $1" ;;
@@ -74,12 +78,14 @@ check_pubkey() {
 }
 ADMIN_PUB_VALUE="$(check_pubkey "$ADMIN_PUB")"
 if [[ "$PROTOCOL" == xray || "$PROTOCOL" == both ]]; then
+    [[ -r "$XRAY_KEY" ]] || die "Missing Xray SSH private key: $XRAY_KEY"
     [[ -r "$XRAY_PUB" ]] || die "Missing Xray SSH key file: $XRAY_PUB"
     check_pubkey "$XRAY_PUB" >/dev/null
 fi
 if [[ "$PROTOCOL" == amnezia || "$PROTOCOL" == both ]]; then
     [[ -f "$SCRIPT_DIR/amnezia-setup.sh" ]] ||
         die "Missing amnezia-setup.sh in this checkout"
+    [[ -r "$AMNEZIA_KEY" ]] || die "Missing Amnezia SSH private key: $AMNEZIA_KEY"
     check_pubkey "$AMNEZIA_PUB" >/dev/null
 fi
 [[ -r "$ADMIN_KEY" ]] || die "Missing vpnadmin private key: $ADMIN_KEY"
@@ -106,6 +112,15 @@ admin_ready() {
     ssh "${ssh_common[@]}" -o BatchMode=yes -i "$ADMIN_KEY" \
         -o IdentitiesOnly=yes "vpnadmin@$SERVER" \
         'test "$(id -un)" = vpnadmin && sudo -n true' </dev/null >/dev/null 2>&1
+}
+verify_service_login() {
+    local user="$1" key="$2"
+    ssh "${ssh_common[@]}" -o BatchMode=yes -i "$key" \
+        -o IdentitiesOnly=yes "$user@$SERVER" \
+        "test \"\$(id -un)\" = '$user' && sudo -n true" \
+        </dev/null >/dev/null 2>&1 ||
+        die "Fresh SSH login and sudo failed for $user; root SSH will remain unchanged"
+    echo "Verified $user SSH and passwordless sudo."
 }
 run_remote_admin_script() {
     local script="$1"; shift
@@ -134,12 +149,14 @@ if [[ "$PROTOCOL" == xray || "$PROTOCOL" == both ]]; then
         "$SERVER" vpnadmin "$ADMIN_KEY" "$XRAY_PUB" "$PORT" \
         -- --skip-package-upgrade --no-ssh-hardening --no-block-ru
     run_remote_admin_script "$SCRIPT_DIR/bin/verify-xray-remote.sh"
+    verify_service_login xray "$XRAY_KEY"
 fi
 if [[ "$PROTOCOL" == amnezia || "$PROTOCOL" == both ]]; then
     echo "Installing/checking separate Amnezia SSH manager."
     AMNEZIA_ADMIN_SSH_KEY="$ADMIN_KEY" \
         bash "$SCRIPT_DIR/amnezia-setup.sh" \
         "$SERVER" vpnadmin "$AMNEZIA_PUB" "$PORT" amnezia
+    verify_service_login amnezia "$AMNEZIA_KEY"
     # This checks the SSH preparation only. Official AmneziaVPN still installs
     # or discovers the actual AWG container via its Self-hosted connection.
 fi
