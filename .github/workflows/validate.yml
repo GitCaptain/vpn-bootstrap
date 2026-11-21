@@ -14,7 +14,12 @@ jobs:
       - name: Check Bash syntax
         run: |
           bash -n vpn-bootstrap.sh
+          bash -n bootstrap.sh
+          bash -n amnezia-setup.sh
           bash -n bin/setup-xray-remote.sh
+          bash -n bin/ensure-vpnadmin-remote.sh
+          bash -n bin/root-ssh-policy-remote.sh
+          bash -n bin/verify-xray-remote.sh
       - name: Check Python syntax
         run: python3 -m py_compile clients/generate_singbox.py
       - name: Run client generator tests
