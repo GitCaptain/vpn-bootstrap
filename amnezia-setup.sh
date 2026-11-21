@@ -192,13 +192,17 @@ fi
 
 if id "$TARGET_USER" >/dev/null 2>&1; then
     echo "User already exists: $TARGET_USER"
-    usermod -s /bin/bash "$TARGET_USER"
+    if [[ "$(getent passwd "$TARGET_USER" | cut -d: -f7)" != /bin/bash ]]; then
+        usermod -s /bin/bash "$TARGET_USER"
+    fi
 else
     useradd -m -s /bin/bash "$TARGET_USER"
     echo "Created user: $TARGET_USER"
 fi
 
-usermod -aG sudo "$TARGET_USER"
+if ! id -nG "$TARGET_USER" | tr ' ' '\n' | grep -Fxq sudo; then
+    usermod -aG sudo "$TARGET_USER"
+fi
 
 echo "Sudo group configured."
 
@@ -381,7 +385,10 @@ fi
 # Only lock an existing account password after the public key has been
 # installed and the new SSH configuration has been validated and reloaded.
 # Never risk locking the previous login during a failed setup step.
-usermod -L "$TARGET_USER"
+shadow_password="$(getent shadow "$TARGET_USER" | cut -d: -f2)"
+if [[ "$shadow_password" != '!'* && "$shadow_password" != '*'* ]]; then
+    usermod -L "$TARGET_USER"
+fi
 
 echo
 echo "======================================"
