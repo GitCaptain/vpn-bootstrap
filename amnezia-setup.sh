@@ -2,13 +2,12 @@
 set -Eeuo pipefail
 
 # Usage:
-# ./amnezia-setup.sh SERVER_IP ADMIN_USER PUBLIC_KEY [SSH_PORT] [NEW_USER] [NEW_PASSWORD]
-# NEW_PASSWORD is an optional legacy override. With no password the account
-# is key-only with locked password, as supported by official AmneziaVPN.
+# ./amnezia-setup.sh SERVER_IP ADMIN_USER PUBLIC_KEY [SSH_PORT] [NEW_USER]
+# The Amnezia SSH account is always key-only, with its password locked.
 # Set AMNEZIA_ADMIN_SSH_KEY=~/.ssh/admin if the provisioning admin uses a key.
 
-if [[ $# -lt 3 || $# -gt 6 ]]; then
-    echo "Usage: $0 SERVER_IP ADMIN_USER PUBLIC_KEY [SSH_PORT] [NEW_USER] [NEW_PASSWORD]"
+if [[ $# -lt 3 || $# -gt 5 ]]; then
+    echo "Usage: $0 SERVER_IP ADMIN_USER PUBLIC_KEY [SSH_PORT] [NEW_USER]"
     exit 1
 fi
 
@@ -17,7 +16,6 @@ ADMIN_USER="$2"
 PUBKEY_FILE="$3"
 SSH_PORT="${4:-22}"
 TARGET_USER="${5:-amnezia}"
-TARGET_PASSWORD="${6:-}"
 
 for cmd in ssh ssh-keygen base64 awk; do
     command -v "$cmd" >/dev/null 2>&1 || {
@@ -45,19 +43,6 @@ fi
 
 if [[ ! "$TARGET_USER" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]]; then
     echo "ERROR: Invalid Linux username."
-    exit 1
-fi
-
-if [[ "$TARGET_PASSWORD" == "-" ]]; then
-    printf "New password for %s: " "$TARGET_USER" >&2
-    IFS= read -r -s TARGET_PASSWORD </dev/tty
-    printf "\n" >&2
-fi
-
-if [[ "$TARGET_PASSWORD" == *:* ||
-      "$TARGET_PASSWORD" == *$'\n'* ||
-      "$TARGET_PASSWORD" == *$'\r'* ]]; then
-    echo "ERROR: Invalid password."
     exit 1
 fi
 
@@ -90,10 +75,7 @@ encode() {
 }
 
 TARGET_USER_B64=$(encode "$TARGET_USER")
-TARGET_PASSWORD_B64=$(encode "$TARGET_PASSWORD")
 PUBKEY_B64=$(encode "$PUBKEY_LINE")
-
-unset TARGET_PASSWORD
 
 # --------------------------------------------------
 # Remote privilege escalation
@@ -121,11 +103,7 @@ echo "New user:    $TARGET_USER"
 echo "SSH port:    $SSH_PORT"
 echo "===================================="
 
-if [[ -n "$TARGET_PASSWORD_B64" ]]; then
-    echo "WARNING: Explicit account password supplied. Key-only SSH login still enforced."
-else
-    echo "Target account password will be locked. Use its SSH private key in AmneziaVPN."
-fi
+echo "Target account password will be locked. Use its SSH private key in AmneziaVPN."
 
 echo
 echo "Connecting using SSH (public key preferred; password for bootstrap admin if necessary)..."
@@ -133,7 +111,6 @@ echo
 
 {
     printf 'TARGET_USER_B64=%s\n' "$TARGET_USER_B64"
-    printf 'TARGET_PASSWORD_B64=%s\n' "$TARGET_PASSWORD_B64"
     printf 'PUBKEY_B64=%s\n' "$PUBKEY_B64"
     printf 'SSH_PORT=%s\n' "$SSH_PORT"
 
@@ -142,7 +119,6 @@ echo
 set -Eeuo pipefail
 
 TARGET_USER=$(printf '%s' "$TARGET_USER_B64" | base64 -d)
-TARGET_PASSWORD=$(printf '%s' "$TARGET_PASSWORD_B64" | base64 -d)
 PUBKEY=$(printf '%s' "$PUBKEY_B64" | base64 -d)
 
 SSH_CONFIG="/etc/ssh/sshd_config"
@@ -154,7 +130,7 @@ if [[ "$(id -u)" -ne 0 ]]; then
     exit 1
 fi
 
-for cmd in useradd usermod chpasswd getent sshd \
+for cmd in useradd usermod getent sshd \
            ssh-keygen systemctl base64 visudo runuser; do
     command -v "$cmd" >/dev/null 2>&1 || {
         echo "ERROR: Required server command not found: $cmd"
@@ -184,14 +160,9 @@ else
     echo "Created user: $TARGET_USER"
 fi
 
-if [[ -n "$TARGET_PASSWORD" ]]; then
-    printf '%s:%s\n' "$TARGET_USER" "$TARGET_PASSWORD" | chpasswd
-else
-    # A password is not needed when the official AmneziaVPN app uses SSH keys.
-    # Lock password login for this account even if an old run set a password.
-    usermod -L "$TARGET_USER"
-fi
-unset TARGET_PASSWORD
+# Lock password authentication, including credentials left by older versions.
+# SSH public-key login remains available for the dedicated Amnezia account.
+usermod -L "$TARGET_USER"
 
 usermod -aG sudo "$TARGET_USER"
 
