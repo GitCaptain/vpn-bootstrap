@@ -6,7 +6,7 @@ from generate_singbox import parse_link, build, domain_suffixes
 
 LINK = ('vless://5f3877a8-19a2-4e7d-a90f-fc4af125c70b@203.0.113.10:443'
         '?encryption=none&flow=xtls-rprx-vision&security=reality&sni=www.example.com'
-        '&fp=chrome&pbk=ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmno&sid=abcd1234&type=tcp#test')
+        '&fp=chrome&pbk=AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8&sid=abcd1234&type=tcp#test')
 
 class ClientConfigTests(unittest.TestCase):
     def test_direct_by_default_on_every_platform(self):
