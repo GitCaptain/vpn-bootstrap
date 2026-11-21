@@ -147,7 +147,7 @@ if [[ "$PROTOCOL" == xray || "$PROTOCOL" == both ]]; then
     echo "Installing/checking Xray."
     bash "$SCRIPT_DIR/bin/setup-xray-remote.sh" \
         "$SERVER" vpnadmin "$ADMIN_KEY" "$XRAY_PUB" "$PORT" \
-        -- --skip-package-upgrade --no-ssh-hardening --no-block-ru
+        -- --skip-package-upgrade --no-ssh-hardening --no-block-ru --no-firewall
     run_remote_admin_script "$SCRIPT_DIR/bin/verify-xray-remote.sh"
     verify_service_login xray "$XRAY_KEY"
 fi
