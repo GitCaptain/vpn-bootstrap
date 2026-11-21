@@ -48,7 +48,7 @@ def domain_suffixes(domains):
         value = value.encode("idna").decode("ascii")
         if not re.fullmatch(r"[a-z0-9.-]+", value) or ".." in value or "." not in value:
             raise ValueError("Invalid domain: " + item)
-        suffix = "." + value
+        suffix = value
         if suffix not in results:
             results.append(suffix)
     return results
@@ -59,8 +59,8 @@ def build(conn, platform, proxy_domains=(), direct_domains=(), block_domains=(),
         raise ValueError("Unsupported platform")
     if proxy_apps and platform != "android":
         raise ValueError("Android package rules require platform=android")
-    if proxy_processes and platform not in ("windows", "linux"):
-        raise ValueError("Process rules are supported here only on Windows and Linux")
+    if proxy_processes and platform not in ("windows", "linux", "macos"):
+        raise ValueError("Process rules are supported here only on Windows, Linux and macOS")
 
     tun = {"type": "tun", "tag": "tun-in",
            "address": ["172.19.0.1/30", "fdfe:dcba:9876::1/126"],
