@@ -13,6 +13,7 @@ Usage:
                  [--admin-key ~/.ssh/vpnadmin] [--admin-pubkey ~/.ssh/vpnadmin.pub]
                  [--xray-key ~/.ssh/xray] [--xray-pubkey ~/.ssh/xray.pub]
                  [--amnezia-key ~/.ssh/amnezia] [--amnezia-pubkey ~/.ssh/amnezia.pub]
+                 --confirm-root-ssh-lockout
 
 Behavior:
   - Invoke from the local checkout; no script or key is fetched from GitHub.
@@ -36,6 +37,7 @@ XRAY_KEY="$HOME/.ssh/xray"
 XRAY_PUB="$HOME/.ssh/xray.pub"
 AMNEZIA_KEY="$HOME/.ssh/amnezia"
 AMNEZIA_PUB="$HOME/.ssh/amnezia.pub"
+CONFIRM_ROOT_LOCKOUT=0
 while (( $# > 0 )); do
     case "$1" in
         --server) SERVER="$2"; shift 2 ;;
@@ -49,6 +51,7 @@ while (( $# > 0 )); do
         --xray-pubkey) XRAY_PUB="$2"; shift 2 ;;
         --amnezia-key) AMNEZIA_KEY="$2"; shift 2 ;;
         --amnezia-pubkey) AMNEZIA_PUB="$2"; shift 2 ;;
+        --confirm-root-ssh-lockout) CONFIRM_ROOT_LOCKOUT=1; shift ;;
         -h|--help) usage; exit 0 ;;
         *) usage >&2; die "Unknown option: $1" ;;
     esac
@@ -59,6 +62,12 @@ done
     die "--protocol must be xray, amnezia, or both"
 [[ "$INITIAL_USER" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]] ||
     die "Invalid --ssh-user"
+# A previous AmneziaVPN self-hosted connection may still store root SSH
+# credentials. Disabling root SSH does not stop AWG packets, but can break
+# future Amnezia server management. Require explicit operator confirmation
+# that access has been migrated and tested *before any server mutation*.
+[[ "$CONFIRM_ROOT_LOCKOUT" -eq 1 ]] ||
+    die "Missing --confirm-root-ssh-lockout. First verify that existing AmneziaVPN server management works via a non-root SSH user, back up its settings, and review docs/EXISTING_AMNEZIA_RUNBOOK.md"
 [[ "$PORT" =~ ^[1-9][0-9]{0,4}$ ]] && (( 10#$PORT <= 65535 )) ||
     die "Invalid SSH port"
 for cmd in ssh ssh-keygen awk bash; do
