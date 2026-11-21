@@ -14,7 +14,8 @@ set -Eeuo pipefail
 #   - Xray-core: VLESS + XTLS Vision + REALITY
 #   - Xray runs as the official image's non-root user on a Docker bridge network
 #     (host VPN port is published to an unprivileged container port)
-#   - Optional blocking of Russian IP destinations and .ru/.su/.рф domains
+#   - Optional, explicit opt-in blocking of Russian destinations on Xray.
+#     Selective site/app routing is done on sing-box clients (default: direct).
 #   - Persistent per-device VPN user management commands
 #
 # The script is incremental/idempotent:
@@ -40,7 +41,7 @@ set -Eeuo pipefail
 #                             The exact stable version is pinned for reproducibility;
 #                             every run checks GitHub's latest stable release and warns
 #                             when the configured version is outdated.
-#   --block-ru                Enable RU destination blocking (default on first install).
+#   --block-ru                Enable RU destination blocking (opt-in on first install).
 #   --no-block-ru             Disable RU destination blocking.
 #   --no-firewall             Do not configure/enable UFW.
 #   --harden-ssh              Second step: run via sudo from the management user.
@@ -117,7 +118,7 @@ Options:
   --xray-image IMAGE          Pin a specific Xray Docker image.
                               Default on first install: ghcr.io/xtls/xray-core:26.3.27.
   --block-ru                  Block Russian IP destinations and .ru/.su/.рф domains.
-                              Enabled by default on first install.
+                              Disabled by default on first install.
   --no-block-ru               Disable RU destination blocking.
   --no-firewall               Do not configure or enable UFW.
   --harden-ssh                Second step, after testing a new management-user SSH login.
@@ -546,17 +547,29 @@ else
     echo "Created user: $VPN_USER"
 fi
 
-usermod --shell /bin/bash "$VPN_USER"
-usermod -aG sudo "$VPN_USER"
-passwd -l "$VPN_USER" >/dev/null 2>&1 || true
+if [[ "$(getent passwd "$VPN_USER" | cut -d: -f7)" != /bin/bash ]]; then
+    usermod --shell /bin/bash "$VPN_USER"
+fi
+if ! id -nG "$VPN_USER" | tr ' ' '\n' | grep -Fxq sudo; then
+    usermod -aG sudo "$VPN_USER"
+fi
+VPN_SHADOW="$(getent shadow "$VPN_USER" | cut -d: -f2)"
+if [[ "$VPN_SHADOW" != '!'* && "$VPN_SHADOW" != '*'* ]]; then
+    passwd -l "$VPN_USER" >/dev/null
+fi
 
 SUDOERS_FILE="/etc/sudoers.d/90-vpn-management-${VPN_USER}"
-SUDOERS_TMP="$(mktemp)"
-printf '%s ALL=(ALL:ALL) NOPASSWD: ALL\n' "$VPN_USER" > "$SUDOERS_TMP"
-chmod 0440 "$SUDOERS_TMP"
-visudo -cf "$SUDOERS_TMP" >/dev/null
-install -o root -g root -m 0440 "$SUDOERS_TMP" "$SUDOERS_FILE"
-rm -f "$SUDOERS_TMP"
+SUDOERS_EXPECTED="$VPN_USER ALL=(ALL:ALL) NOPASSWD: ALL"
+if [[ ! -f "$SUDOERS_FILE" ||
+      "$(cat "$SUDOERS_FILE")" != "$SUDOERS_EXPECTED" ||
+      "$(stat -c %a "$SUDOERS_FILE")" != 440 ]]; then
+    SUDOERS_TMP="$(mktemp)"
+    printf '%s\n' "$SUDOERS_EXPECTED" > "$SUDOERS_TMP"
+    chmod 0440 "$SUDOERS_TMP"
+    visudo -cf "$SUDOERS_TMP" >/dev/null
+    install -o root -g root -m 0440 "$SUDOERS_TMP" "$SUDOERS_FILE"
+    rm -f "$SUDOERS_TMP"
+fi
 
 USER_HOME="$(getent passwd "$VPN_USER" | cut -d: -f6)"
 [[ -n "$USER_HOME" && "$USER_HOME" != "/" ]] || die "Invalid home directory for $VPN_USER."
@@ -655,8 +668,15 @@ systemctl start apt-daily.timer apt-daily-upgrade.timer >/dev/null 2>&1 || true
 # ------------------------------------------------------------------------------
 
 log "DOCKER ENGINE"
+DOCKER_PREEXISTING=0
 if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
+    DOCKER_PREEXISTING=1
     echo "Functional Docker installation already exists; reusing it."
+elif command -v docker >/dev/null 2>&1; then
+    # Existing AmneziaWG containers may depend on this Docker daemon.
+    # Never uninstall/reinstall Docker while the daemon is unhealthy:
+    # that could destroy the backup VPN's availability and state.
+    die "Docker is installed but unusable. Stop rather than replacing Docker; repair the existing daemon manually and confirm AmneziaWG still works."
 else
     # Remove packages that conflict with Docker CE when a partial/non-working
     # container runtime is already present. Existing Docker data under
@@ -713,40 +733,47 @@ if ! docker compose version >/dev/null 2>&1; then
 fi
 echo "Compose: $(docker compose version)"
 
-# Keep Docker logs bounded and keep containers alive across daemon upgrades when possible.
-DOCKER_DAEMON_JSON="/etc/docker/daemon.json"
-DOCKER_DAEMON_TMP="$(mktemp)"
-if [[ -s "$DOCKER_DAEMON_JSON" ]]; then
-    jq empty "$DOCKER_DAEMON_JSON" || die "$DOCKER_DAEMON_JSON contains invalid JSON."
-    jq '. + {"live-restore": true, "log-driver": "json-file", "log-opts": ((.["log-opts"] // {}) + {"max-size":"10m","max-file":"3"})}' \
-        "$DOCKER_DAEMON_JSON" > "$DOCKER_DAEMON_TMP"
+# Never mutate or restart an already-running Docker daemon: it may host the
+# existing AmneziaWG backup.  Logging defaults and live-restore are
+# host-global and not safe to change during Xray-only provisioning.
+if [[ "$DOCKER_PREEXISTING" -eq 1 ]]; then
+    echo "Pre-existing Docker daemon configuration and running containers preserved."
 else
-    jq -n '{"live-restore": true, "log-driver":"json-file", "log-opts":{"max-size":"10m","max-file":"3"}}' \
-        > "$DOCKER_DAEMON_TMP"
-fi
-
-if [[ ! -f "$DOCKER_DAEMON_JSON" ]] || ! cmp -s "$DOCKER_DAEMON_TMP" "$DOCKER_DAEMON_JSON"; then
-    dockerd --validate --config-file "$DOCKER_DAEMON_TMP" >/dev/null
-    DOCKER_CONFIG_BACKUP="$(mktemp)"
-    DOCKER_CONFIG_EXISTED=0
-    if [[ -f "$DOCKER_DAEMON_JSON" ]]; then
-        cp -a "$DOCKER_DAEMON_JSON" "$DOCKER_CONFIG_BACKUP"
-        DOCKER_CONFIG_EXISTED=1
+    # Keep Docker logs bounded and keep containers alive across daemon upgrades when possible.
+    DOCKER_DAEMON_JSON="/etc/docker/daemon.json"
+    DOCKER_DAEMON_TMP="$(mktemp)"
+    if [[ -s "$DOCKER_DAEMON_JSON" ]]; then
+        jq empty "$DOCKER_DAEMON_JSON" || die "$DOCKER_DAEMON_JSON contains invalid JSON."
+        jq '. + {"live-restore": true, "log-driver": "json-file", "log-opts": ((.["log-opts"] // {}) + {"max-size":"10m","max-file":"3"})}' \
+            "$DOCKER_DAEMON_JSON" > "$DOCKER_DAEMON_TMP"
+    else
+        jq -n '{"live-restore": true, "log-driver":"json-file", "log-opts":{"max-size":"10m","max-file":"3"}}' \
+            > "$DOCKER_DAEMON_TMP"
     fi
-    install -o root -g root -m 0644 "$DOCKER_DAEMON_TMP" "$DOCKER_DAEMON_JSON"
-    if ! systemctl restart docker || ! systemctl is-active --quiet docker; then
-        if [[ "$DOCKER_CONFIG_EXISTED" -eq 1 ]]; then
-            cp -a "$DOCKER_CONFIG_BACKUP" "$DOCKER_DAEMON_JSON"
-        else
-            rm -f "$DOCKER_DAEMON_JSON"
+    
+    if [[ ! -f "$DOCKER_DAEMON_JSON" ]] || ! cmp -s "$DOCKER_DAEMON_TMP" "$DOCKER_DAEMON_JSON"; then
+        dockerd --validate --config-file "$DOCKER_DAEMON_TMP" >/dev/null
+        DOCKER_CONFIG_BACKUP="$(mktemp)"
+        DOCKER_CONFIG_EXISTED=0
+        if [[ -f "$DOCKER_DAEMON_JSON" ]]; then
+            cp -a "$DOCKER_DAEMON_JSON" "$DOCKER_CONFIG_BACKUP"
+            DOCKER_CONFIG_EXISTED=1
         fi
-        systemctl restart docker || warn "Docker recovery failed; inspect journalctl -u docker."
-        rm -f "$DOCKER_CONFIG_BACKUP" "$DOCKER_DAEMON_TMP"
-        die "Docker rejected the new daemon settings; previous configuration restored."
+        install -o root -g root -m 0644 "$DOCKER_DAEMON_TMP" "$DOCKER_DAEMON_JSON"
+        if ! systemctl restart docker || ! systemctl is-active --quiet docker; then
+            if [[ "$DOCKER_CONFIG_EXISTED" -eq 1 ]]; then
+                cp -a "$DOCKER_CONFIG_BACKUP" "$DOCKER_DAEMON_JSON"
+            else
+                rm -f "$DOCKER_DAEMON_JSON"
+            fi
+            systemctl restart docker || warn "Docker recovery failed; inspect journalctl -u docker."
+            rm -f "$DOCKER_CONFIG_BACKUP" "$DOCKER_DAEMON_TMP"
+            die "Docker rejected the new daemon settings; previous configuration restored."
+        fi
+        rm -f "$DOCKER_CONFIG_BACKUP"
     fi
-    rm -f "$DOCKER_CONFIG_BACKUP"
+    rm -f "$DOCKER_DAEMON_TMP"
 fi
-rm -f "$DOCKER_DAEMON_TMP"
 
 # ------------------------------------------------------------------------------
 # Harden SSH
@@ -936,7 +963,7 @@ else
     XRAY_IMAGE="${XRAY_IMAGE_ARG:-$DEFAULT_XRAY_IMAGE}"
     XRAY_PORT="${XRAY_PORT_ARG:-$DEFAULT_XRAY_PORT}"
     REALITY_TARGET="${REALITY_TARGET_ARG:-$DEFAULT_REALITY_TARGET}"
-    BLOCK_RU="${BLOCK_RU_ARG:-true}"
+    BLOCK_RU="${BLOCK_RU_ARG:-false}"
 
     if [[ -n "$ENDPOINT_ARG" ]]; then
         ENDPOINT_MODE="manual"
@@ -989,7 +1016,9 @@ jq -Rn \
         server_ipv6:$server_ipv6,
         ipv6_egress_ok:$ipv6_ok
     }' > "$STATE_TMP" <<< "$REALITY_PRIVATE_KEY"
-install -o root -g root -m 0600 "$STATE_TMP" "$STATE_FILE"
+if [[ ! -f "$STATE_FILE" ]] || ! cmp -s "$STATE_TMP" "$STATE_FILE"; then
+    install -o root -g root -m 0600 "$STATE_TMP" "$STATE_FILE"
+fi
 rm -f "$STATE_TMP"
 
 # ------------------------------------------------------------------------------
@@ -1004,15 +1033,23 @@ check_xray_version "$XRAY_IMAGE"
 # ------------------------------------------------------------------------------
 
 log "REALITY TARGET CHECK"
-if timeout 12 openssl s_client \
+# Validate both the certificate identity and HTTP/2 ALPN negotiation.  Merely
+# seeing "TLSv1.3" in openssl output can accept a mismatched or broken target.
+TLS_PROBE_OUTPUT=""
+if TLS_PROBE_OUTPUT="$(timeout 12 openssl s_client \
     -connect "${REALITY_TARGET}:443" \
     -servername "$REALITY_TARGET" \
-    -tls1_3 \
-    -brief </dev/null 2>&1 | grep -F 'TLSv1.3' >/dev/null; then
-    echo "REALITY target supports TLS 1.3: $REALITY_TARGET"
+    -tls1_3 -alpn h2 \
+    -verify_hostname "$REALITY_TARGET" \
+    -verify_return_error </dev/null 2>&1)" && \
+    grep -Fq 'ALPN protocol: h2' <<< "$TLS_PROBE_OUTPUT"; then
+    echo "REALITY target TLS 1.3, certificate hostname and HTTP/2: OK"
 else
-    die "REALITY target failed the TLS 1.3 check: $REALITY_TARGET. Use --reality-target HOST."
+    warn "REALITY target diagnostic:"
+    printf '%s\n' "$TLS_PROBE_OUTPUT" | tail -n 12 >&2
+    die "REALITY target TLS 1.3/certificate/HTTP2 check failed: $REALITY_TARGET"
 fi
+unset TLS_PROBE_OUTPUT
 
 # ------------------------------------------------------------------------------
 # Install renderer and management command
@@ -1061,11 +1098,10 @@ else
     NETWORK_IPV6_LINE=""
 fi
 
-if [[ "$IPV6_OK" == "true" ]]; then
-    FREEDOM_STRATEGY="UseIPv6v4"
-else
-    FREEDOM_STRATEGY="UseIPv4"
-fi
+# The host's IPv6 probe does not validate Docker bridge IPv6 egress.
+# Until a network-namespace probe is available, prefer reliable IPv4 DNS
+# resolution.  Existing IPv6 literals still use the kernel routing table.
+FREEDOM_STRATEGY="UseIPv4"
 
 # The official Xray image runs as a non-root user by default. Keep the
 # temporary config inside the root-only VPN directory. The config file itself
@@ -1093,12 +1129,12 @@ cleanup_deployment() {
         if [[ "$HAD_COMPOSE" -eq 1 ]]; then
             cp -a "$DEPLOY_BACKUP/compose.yml" "$COMPOSE_FILE"
             # Recreate: a single-file bind mount may still reference the replaced inode.
-            if ! docker compose --project-directory "$VPN_ROOT" -f "$COMPOSE_FILE" up -d --force-recreate --remove-orphans >&2; then
+            if ! docker compose --project-directory "$VPN_ROOT" -f "$COMPOSE_FILE" up -d --force-recreate >&2; then
                 echo "ERROR: automatic deployment recovery failed; check Docker logs." >&2
             fi
         else
             # Only remove the deployment if Compose actually created it for us.
-            docker compose --project-directory "$VPN_ROOT" -f "$COMPOSE_FILE" down --remove-orphans >&2 || true
+            docker compose --project-directory "$VPN_ROOT" -f "$COMPOSE_FILE" down >&2 || true
             rm -f "$COMPOSE_FILE"
         fi
     fi
@@ -1193,6 +1229,23 @@ chmod 0644 "$CONFIG_TMP"
 
 # Validate the new configuration before replacing the live one.
 # Keep Xray's diagnostic output so a configuration failure is actionable.
+# No-op on reruns: do not pull images, recreate containers, or touch bind
+# mounts when the desired configuration is identical and Xray is healthy.
+# Force a deploy only if the image/config/compose changed or service is down.
+if [[ -f "$XRAY_DIR/config.json" && -f "$COMPOSE_FILE" ]] &&
+   cmp -s "$CONFIG_TMP" "$XRAY_DIR/config.json" &&
+   [[ "$(docker inspect -f '{{.Config.Image}} {{.State.Running}}' "$XRAY_CONTAINER" 2>/dev/null || true)" == "$XRAY_IMAGE true" ]] &&
+   nc -4 -z -w 2 127.0.0.1 "$XRAY_PORT" >/dev/null 2>&1; then
+    # Compose content is generated later; avoid an early exit until it, too,
+    # is compared with the previously applied desired state.
+    CONFIG_UNCHANGED=1
+else
+    CONFIG_UNCHANGED=0
+fi
+
+# Run a syntax validation on changed configs before any live mutation. An
+# unchanged, running deployment can be left untouched without pulling.
+if [[ "$CONFIG_UNCHANGED" -eq 0 ]]; then
 docker pull "$XRAY_IMAGE" >/dev/null
 
 if docker run --rm \
@@ -1209,6 +1262,7 @@ else
     echo "----------------------------------" >&2
     exit "$rc"
 fi
+fi  # new/changed Xray config
 
 # Use the normal Docker bridge model. The official Xray image remains non-root
 # and listens on an unprivileged container port. Docker publishes the requested
@@ -1223,6 +1277,9 @@ services:
     read_only: true
     security_opt:
       - no-new-privileges:true
+    cap_drop:
+      - ALL
+    pids_limit: 128
     ports:
       - "${XRAY_PORT}:${XRAY_CONTAINER_PORT}/tcp"
     networks:
@@ -1246,10 +1303,25 @@ chmod 0600 "$COMPOSE_TMP"
 cd "$VPN_ROOT"
 # Relative volume paths are resolved against VPN_ROOT even for the candidate file.
 docker compose --project-directory "$VPN_ROOT" -f "$COMPOSE_TMP" config -q
+if [[ "$CONFIG_UNCHANGED" -eq 1 ]] &&
+   cmp -s "$COMPOSE_TMP" "$COMPOSE_FILE"; then
+    echo "Xray configuration unchanged and container healthy; skipping recreation."
+    exit 0
+fi
+
+# A modified Compose file needs the normal validated deployment path even if
+# config.json is unchanged.
+if [[ "$CONFIG_UNCHANGED" -eq 1 ]]; then
+    docker pull "$XRAY_IMAGE" >/dev/null
+    docker run --rm --network none \
+        -v "$CONFIG_TMP:/etc/xray/config.json:ro" "$XRAY_IMAGE" \
+        run -test -config /etc/xray/config.json >"$VALIDATION_LOG" 2>&1 ||
+        { cat "$VALIDATION_LOG" >&2; exit 1; }
+fi
 DEPLOY_PENDING=1
 install -o root -g root -m 0644 "$CONFIG_TMP" "$XRAY_DIR/config.json"
 install -o root -g root -m 0600 "$COMPOSE_TMP" "$COMPOSE_FILE"
-docker compose --project-directory "$VPN_ROOT" -f "$COMPOSE_FILE" up -d --force-recreate --remove-orphans
+docker compose --project-directory "$VPN_ROOT" -f "$COMPOSE_FILE" up -d --force-recreate
 
 for _ in $(seq 1 20); do
     if [[ "$(docker inspect -f '{{.State.Running}}' "$XRAY_CONTAINER" 2>/dev/null || true)" == "true" ]] && \
@@ -1328,11 +1400,8 @@ show_user() {
     echo "Primary link:"
     build_link "$name" "$uuid" "$sid" "$ENDPOINT_HOST"
 
-    if [[ "$IPV6_OK" == "true" && -n "$SERVER_IPV6" && "$ENDPOINT_HOST" != "$SERVER_IPV6" ]]; then
-        echo
-        echo "Direct IPv6 link:"
-        build_link "${name}-IPv6" "$uuid" "$sid" "$SERVER_IPV6"
-    fi
+    # Do not advertise a direct IPv6 endpoint merely from host outbound
+    # connectivity. The external Docker-published port may not be reachable.
 }
 
 add_user() {

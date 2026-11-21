@@ -1,0 +1,11 @@
+# Never commit personal VPN credentials or generated device profiles.
+*.vless
+*.link
+*.secret.json
+*.singbox.json
+/profiles/
+/private/
+.env
+.env.*
+__pycache__/
+*.pyc

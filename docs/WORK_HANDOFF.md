@@ -1,0 +1,129 @@
+# VPN setup — project handoff (21 November 2026)
+
+This document records the decisions from the ChatGPT VPN setup discussion for
+continued work in ChatGPT Work or other code-review sessions.
+
+## Sources
+- Repo: https://github.com/GitCaptain/vpn-bootstrap
+- Primary script: master/vpn-bootstrap.sh
+- Backup AmneziaWG: amnezia/amnezia-setup.sh
+- Draft Xray/client PR: https://github.com/GitCaptain/vpn-bootstrap/pull/1
+
+## Requirements (confirmed by user)
+1. Primary VPN: Xray VLESS + REALITY + XTLS Vision.
+2. **SELECTIVE client routing**: all traffic DIRECT by default. Only an
+   explicit, editable list of websites and apps uses Xray. This includes
+   Russian sites: direct. China can later get additional rules, but currently
+   remains direct by default. User gave ChatGPT and Telegram as *examples* of
+   selectable applications/services; not a fixed allowlist.
+3. Target operating systems: Android, iOS, macOS, Windows, Linux. sing-box
+   chosen as candidate unified core/client. Check current official graphical
+   clients and real feature differences: package-name routing on Android,
+   process matching on supported Windows/Linux builds, domain rules on iOS.
+4. Backup connection: **AmneziaWG, separate AmneziaVPN client/server and
+   config**, independent from Xray. Do not mix Amnezia VPN imports with the
+   principal Xray client and do not disturb AWG.
+5. GitHub commits and PRs preferred over pasting scripts or archives in chat.
+6. Protect existing VPS SSH access, never deploy/disable password/root access
+   without explicit review and verified second login. No server deployment
+   was requested.
+7. Preserve existing Xray keys/users and state. Upgrades must be explicit and
+   reversible. Verify REALITY ClientHello/uTLS compatibility before upgrading.
+
+## Review of amnezia/amnezia-setup.sh (not merged into Xray)
+- Default created account password is literal `amnezia` unless overridden;
+  this is unsafe. Prompt securely or generate a random password.
+- The newly created user receives unrestricted passwordless sudo
+  (`NOPASSWD: ALL`). Minimize privileges or explicitly document the risk.
+- Initial SSH transport demands password/keyboard-interactive authentication
+  (PubkeyAuthentication=no), so it cannot work against key-only SSH.
+- User/password data are passed as base64, which is **not encryption**.
+  Treat pipeline/process/environment exposure as a security concern.
+- The SSH Match block is appended to sshd_config, with backup/validation, but
+  interacts with other Match blocks and should be tested using sshd -T on
+  supported Ubuntu releases. Prefer a dedicated drop-in and staged rollout.
+- Script prepares a privileged SSH account **for using AmneziaVPN**; it does
+  not deploy AmneziaWG itself. Do not conflate client preparation and server
+  protocol setup.
+- Work on this file separately, targeting the `amnezia` branch.
+
+## Draft PR #1 coverage
+- Xray bootstrap: RU server blocking opt-in for new installations; older
+  state remains unchanged. Harden REALITY target validation.
+- Conservative IPv4 resolution when Docker IPv6 egress not tested.
+- Do not advertise outbound-detected IPv6 as inbound reachable automatically.
+- Container capabilities dropped and PID limit set.
+- `clients/generate_singbox.py` with `route.final=direct`, `dns.final=local-dns`,
+  explicit proxy-domain and Android app / Windows Linux process rules,
+  no credentials in Git.
+- README and unit tests; not yet end-to-end integration verified.
+
+## Outstanding tasks
+- CI syntax checks on Bash and Python, integration tests with actual sing-box
+  binaries and supported OS clients.
+- Verify domain DNS/routing for selected websites and content/CDNs.
+- Better Docker-namespace IPv6 diagnostics; avoid UFW/Docker bypass and
+  stale rules on port changes.
+- Review correct Xray REALITY target choice and default fingerprint against
+  the pinned Xray 26.3.27 and specific sing-box client versions.
+- Add stable, secure client configuration distribution/provisioning if needed,
+  without committing user secrets.
+- Keep Xray PR draft until review and tests; do not merge/deploy automatically.
+
+## Updated local-first deployment architecture (21 Nov 2026)
+- The user will invoke setup scripts on their **own workstation**, passing
+  the destination VPS address. No automatic deployments or GitHub Actions
+  deployments to the VPS.
+- Xray setup: `bin/setup-xray-remote.sh` streams the existing
+  `vpn-bootstrap.sh` over SSH, with an independent `xray` management account.
+  Use an existing root or passwordless-sudo admin for the initial connection.
+  Xray container remains the dedicated `xray-reality` Docker service.
+- Amnezia setup: `amnezia-setup.sh` already runs from the workstation;
+  a separate review PR is open:
+  https://github.com/GitCaptain/vpn-bootstrap/pull/2 (base: amnezia).
+  It creates/maintains independent SSH account `amnezia`, locked password
+  and SSH key only. It deliberately retains unrestricted passwordless sudo
+  per upstream AmneziaVPN installation requirements.
+- AmneziaWG container is installed by official AmneziaVPN Self-hosted UI
+  *after* account prep, and must be separate from Xray. Distinct SSH identities
+  and containers do not equal isolation from root when admins have NOPASSWD
+  sudo; AmneziaWG may need privileged NET_ADMIN in its container.
+- Official AmneziaVPN supports either SSH password or private-key
+  authentication and non-root sudo account with passwordless permissions:
+  https://docs.amnezia.org/documentation/supported-linux-os-for-vps/
+  https://docs.amnezia.org/troubleshooting/error-codes/
+- A new chat does not automatically enable Work; current GitHub integration
+  is usable in this chat. For context in any new chat, point it to this file
+  and both PRs.
+
+## Latest bootstrap requirements (21 Nov 2026, second review)
+
+1. A **single local entrypoint** `bootstrap.sh` selects `--protocol xray`,
+   `amnezia`, or `both` and takes `--server` and SSH key paths.
+2. Repeat runs MUST preserve keys, users, VPN state and other protocol's
+   containers. Xray renderer now detects unchanged config/Compose and skips
+   recreation of the healthy container; Amnezia account setup has a guarded
+   no-op path. The main bootstrap reuses a verified non-root administrator.
+3. SSH identities are **vpnadmin** (persistent fallback/setup administrator),
+   **xray** and **amnezia**, with independent keys. Xray uses a non-root
+   Docker image; official AmneziaWG Docker runtime may require privileged
+   capabilities. Each service has its own container. Sudo access is
+   root-equivalent and thus not a strict security isolation boundary.
+4. A successful bootstrap must leave **root SSH prohibited by password AND
+   by key**. Implemented via `PermitRootLogin no`, automatic scheduled
+   rollback, effective `sshd -T` checks, independent fresh SSH login using
+   `vpnadmin`, and follow-up verification. Failure leaves existing root
+   SSH settings intact or allows automatic restoration.
+5. The AmneziaWG network protocol **officially uses UDP**. It is installed
+   and managed by the official AmneziaVPN Self-hosted app. The local
+   `amnezia-setup.sh` prepares SSH admin access but **does not itself deploy
+   an AmneziaWG container**. A fully unattended headless official
+   AWG installation is NOT completed in this PR; do not claim otherwise.
+6. No server deployments have been made in chat. Both PRs are drafts until
+   VM integration tests including SSH rollback and actual AmneziaVPN install
+   are completed. Static GitHub Actions checks are not sufficient.
+
+References:
+- https://docs.amnezia.org/documentation/instructions/install-vpn-on-server/
+- https://docs.amnezia.org/documentation/instructions/new-amneziawg-selfhosted/
+- https://man.openbsd.org/sshd_config
