@@ -160,10 +160,6 @@ else
     echo "Created user: $TARGET_USER"
 fi
 
-# Lock password authentication, including credentials left by older versions.
-# SSH public-key login remains available for the dedicated Amnezia account.
-usermod -L "$TARGET_USER"
-
 usermod -aG sudo "$TARGET_USER"
 
 echo "Sudo group configured."
@@ -343,6 +339,11 @@ else
 
     exit 1
 fi
+
+# Only lock an existing account password after the public key has been
+# installed and the new SSH configuration has been validated and reloaded.
+# Never risk locking the previous login during a failed setup step.
+usermod -L "$TARGET_USER"
 
 echo
 echo "======================================"
