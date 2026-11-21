@@ -1,0 +1,63 @@
+name: Validate VPN bootstrap and sing-box generator
+
+on:
+  pull_request:
+  push:
+    branches:
+      - fix/selective-xray-routing-2026-11
+
+jobs:
+  static-checks:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check Bash syntax
+        run: |
+          bash -n vpn-bootstrap.sh
+          bash -n bootstrap.sh
+          bash -n amnezia-setup.sh
+          bash -n bin/setup-xray-remote.sh
+          bash -n bin/audit-vps.sh
+          bash -n bin/guard-awg-remote.sh
+          bash -n bin/ensure-vpnadmin-remote.sh
+          bash -n bin/add-admin-key.sh
+          bash -n bin/root-ssh-policy-remote.sh
+          bash -n bin/verify-xray-remote.sh
+      - name: Offline bootstrap safety guards
+        run: bash tests/smoke-bootstrap.sh
+      - name: Check Python syntax
+        run: python3 -m py_compile clients/generate_singbox.py
+      - name: Run client generator tests
+        run: python3 -m unittest discover -s clients/tests -v
+      - name: Validate profiles using sing-box 1.14.4
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          archive="$RUNNER_TEMP/sing-box.tgz"
+          curl --fail --location --silent --show-error \
+            'https://github.com/SagerNet/sing-box/releases/download/v1.14.4/sing-box-1.14.4-linux-amd64.tar.gz' \
+            --output "$archive"
+          tar -xf "$archive" -C "$RUNNER_TEMP"
+          singbox="$RUNNER_TEMP/sing-box-1.14.4-linux-amd64/sing-box"
+          "$singbox" version
+          # Representative output of iplist.opencck.org: format=singbox&data=domains.
+          cat > "$RUNNER_TEMP/iplist-selected.json" <<'JSON'
+          {"version":1,"rules":[{"domain":["youtube.com"],"domain_suffix":[".youtube.com"]}]}
+          JSON
+          for platform in android ios macos windows linux; do
+            output="$RUNNER_TEMP/profile-$platform.json"
+            python3 - "$output" "$platform" "$RUNNER_TEMP/iplist-selected.json" <<'PY'
+          import json, sys
+          sys.path.insert(0, "clients")
+          from generate_singbox import parse_link, build, load_iplist_rule_set
+          link = ('vless://5f3877a8-19a2-4e7d-a90f-fc4af125c70b@203.0.113.10:443'
+                  '?encryption=none&flow=xtls-rprx-vision&security=reality'
+                  '&sni=www.example.com&fp=chrome'
+                  '&pbk=AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8&sid=abcd1234&type=tcp')
+          data = build(parse_link(link), sys.argv[2], proxy_domains=["openai.com"],
+               iplist_rules=load_iplist_rule_set(sys.argv[3]))
+          with open(sys.argv[1], "w", encoding="utf8") as out:
+              json.dump(data, out)
+          PY
+            "$singbox" check -c "$output"
+          done
